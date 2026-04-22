@@ -612,7 +612,12 @@ def merge_dicts(a: dict, b: dict, path: tuple[str, ...] = ()):
 
 @cache
 def get_browser_use_version() -> str:
-	"""Get the browser-use package version using the same logic as Agent._set_browser_use_version_and_source"""
+	"""Get the installed package version.
+
+	The import package remains ``browser_use`` for compatibility, but this fork is
+	published as ``autotester-use``. Try both distribution names when installed
+	from a wheel.
+	"""
 	try:
 		package_root = Path(__file__).parent.parent
 		pyproject_path = package_root / 'pyproject.toml'
@@ -632,13 +637,17 @@ def get_browser_use_version() -> str:
 		# If pyproject.toml doesn't exist, try getting version from pip
 		from importlib.metadata import version as get_version
 
-		version = str(get_version('browser-use'))
-		os.environ['LIBRARY_VERSION'] = version
-		return version
+		for package_name in ('autotester-use', 'browser-use'):
+			try:
+				version = str(get_version(package_name))
+				os.environ['LIBRARY_VERSION'] = version
+				return version
+			except Exception:
+				continue
 
 	except Exception as e:
 		logger.debug(f'Error detecting browser-use version: {type(e).__name__}: {e}')
-		return 'unknown'
+	return 'unknown'
 
 
 async def check_latest_browser_use_version() -> str | None:

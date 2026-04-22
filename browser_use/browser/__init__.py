@@ -2,12 +2,14 @@ from typing import TYPE_CHECKING
 
 # Type stubs for lazy imports
 if TYPE_CHECKING:
+	from .api_collection import ApiCollectionConfig
 	from .profile import BrowserProfile, ProxySettings
 	from .session import BrowserSession
 
 
 # Lazy imports mapping for heavy browser components
 _LAZY_IMPORTS = {
+	'ApiCollectionConfig': ('.api_collection', 'ApiCollectionConfig'),
 	'ProxySettings': ('.profile', 'ProxySettings'),
 	'BrowserProfile': ('.profile', 'BrowserProfile'),
 	'BrowserSession': ('.session', 'BrowserSession'),
@@ -38,4 +40,5 @@ __all__ = [
 	'BrowserSession',
 	'BrowserProfile',
 	'ProxySettings',
+	'ApiCollectionConfig',
 ]

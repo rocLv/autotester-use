@@ -1,9 +1,10 @@
 [project]
-name = "browser-use"
-description = "Make websites accessible for AI agents"
+name = "autotester-use"
+description = "Browser automation for AI agents with API collection support"
 authors = [{ name = "Gregor Zunic" }]
-version = "0.12.6"
+version = "0.12.6.post1"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11,<4.0"
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -77,8 +78,8 @@ eval = [
     "psutil==7.2.2",
     "datamodel-code-generator==0.53.0",
 ]
-cli-oci = ["browser-use[cli,oci]"]
-all = ["browser-use[cli,examples,aws,oci]"]
+cli-oci = ["autotester-use[cli,oci]"]
+all = ["autotester-use[cli,examples,aws,oci]"]
 
 # will prefer to use local source code checked out in ../../browser-use (if present) instead of pypi browser-use package
 # [tool.uv.sources]
@@ -88,7 +89,7 @@ all = ["browser-use[cli,examples,aws,oci]"]
 [project.urls]
 Homepage = "https://browser-use.com"
 Documentation = "https://docs.browser-use.com"
-Repository = "https://github.com/browser-use/browser-use"
+Repository = "https://github.com/rocLv/autotester-use"
 Telemetry = "https://docs.browser-use.com/development/monitoring/telemetry"
 "Terms of Service" = "https://browser-use.com/legal/terms-of-service"
 "Privacy Policy" = "https://browser-use.com/privacy/"
@@ -98,6 +99,8 @@ browser-use = "browser_use.skill_cli.main:main"  # Fast CLI for browser automati
 browseruse = "browser_use.skill_cli.main:main"  # Alias for browser-use
 bu = "browser_use.skill_cli.main:main"  # Alias for browser-use
 browser = "browser_use.skill_cli.main:main"  # Alias for browser-use
+autotester-use = "browser_use.skill_cli.main:main"  # Alias for autotester-use
+autotester = "browser_use.skill_cli.main:main"  # Alias for autotester-use
 browser-use-tui = "browser_use.cli:main"  # Legacy TUI interface
 
 [build-system]

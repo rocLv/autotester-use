@@ -51,7 +51,7 @@
 
 **1. Create environment and install Browser-Use with [uv](https://docs.astral.sh/uv/) (Python>=3.11):**
 ```bash
-uv init && uv add browser-use && uv sync
+uv init && uv add autotester-use && uv sync
 # uvx browser-use install  # Run if you don't have Chromium installed
 ```
 

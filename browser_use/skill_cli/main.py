@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import zlib
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 # =============================================================================
@@ -48,6 +49,16 @@ def _get_subcommand() -> str | None:
 		if not arg.startswith('-'):
 			return arg
 	return None
+
+
+def _get_installed_version() -> str:
+	"""Return the installed distribution version without importing browser_use."""
+	for package_name in ('autotester-use', 'browser-use'):
+		try:
+			return version(package_name)
+		except PackageNotFoundError:
+			continue
+	return 'unknown'
 
 
 # Handle 'install' command - installs Chromium browser + system dependencies
@@ -632,6 +643,7 @@ Setup:
 	)
 
 	# Global flags
+	parser.add_argument('--version', action='version', version=_get_installed_version())
 	parser.add_argument('--headed', action='store_true', help='Show browser window')
 	parser.add_argument(
 		'--profile',

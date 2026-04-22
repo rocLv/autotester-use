@@ -530,6 +530,7 @@ class BrowserSession(BaseModel):
 	_permissions_watchdog: Any | None = PrivateAttr(default=None)
 	_recording_watchdog: Any | None = PrivateAttr(default=None)
 	_captcha_watchdog: Any | None = PrivateAttr(default=None)
+	_api_collection_watchdog: Any | None = PrivateAttr(default=None)
 	_watchdogs_attached: bool = PrivateAttr(default=False)
 
 	_cloud_browser_client: CloudBrowserClient = PrivateAttr(default_factory=lambda: CloudBrowserClient())
@@ -631,6 +632,7 @@ class BrowserSession(BaseModel):
 		self._permissions_watchdog = None
 		self._recording_watchdog = None
 		self._captcha_watchdog = None
+		self._api_collection_watchdog = None
 		self._watchdogs_attached = False
 		if self._demo_mode:
 			self._demo_mode.reset()
@@ -1262,6 +1264,46 @@ class BrowserSession(BaseModel):
 		"""Get the cached root CDP cdp_session.cdp_client. The client is created and started in self.connect()."""
 		assert self._cdp_client_root is not None, 'CDP client not initialized - browser may not be connected yet'
 		return self._cdp_client_root
+
+	async def start_api_collection(self, config: Any | None = None) -> None:
+		"""Start collecting same-site API traffic for OpenAPI 3.0 export.
+
+		Args:
+			config: Optional ApiCollectionConfig. A plain dict is also accepted.
+		"""
+		from browser_use.browser.api_collection import ApiCollectionConfig
+		from browser_use.browser.watchdogs.api_collection_watchdog import ApiCollectionWatchdog
+
+		resolved_config = config if isinstance(config, ApiCollectionConfig) else ApiCollectionConfig.model_validate(config or {})
+
+		if self._api_collection_watchdog is None:
+			ApiCollectionWatchdog.model_rebuild()
+			self._api_collection_watchdog = ApiCollectionWatchdog(event_bus=self.event_bus, browser_session=self)
+			self._api_collection_watchdog.attach_to_session()
+
+		await self._api_collection_watchdog.start_collection(resolved_config)
+
+	def get_api_schema(self) -> dict[str, Any]:
+		"""Return the current OpenAPI 3.0 schema for collected API traffic."""
+		if self._api_collection_watchdog is None:
+			from browser_use.browser.api_collection import ApiSchemaCollector
+
+			return ApiSchemaCollector().to_openapi()
+		return self._api_collection_watchdog.get_schema()
+
+	async def export_api_schema(self, path: str | Path | None = None) -> Path | None:
+		"""Write the current OpenAPI 3.0 schema to disk.
+
+		Returns None when no path is provided and collection was not configured with an output path.
+		"""
+		if self._api_collection_watchdog is None:
+			return None
+		return await self._api_collection_watchdog.export_schema(path)
+
+	def stop_api_collection(self) -> None:
+		"""Stop collecting new API observations while preserving the collected schema."""
+		if self._api_collection_watchdog is not None:
+			self._api_collection_watchdog.stop_collection()
 
 	async def new_page(self, url: str | None = None) -> 'Page':
 		"""Create a new page (tab)."""

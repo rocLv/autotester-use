@@ -1,4 +1,5 @@
 import os
+from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING
 
 from browser_use.logging_config import setup_logging
@@ -42,6 +43,15 @@ def _patched_del(self):
 
 base_subprocess.BaseSubprocessTransport.__del__ = _patched_del
 
+for _package_name in ('autotester-use', 'browser-use'):
+	try:
+		__version__ = version(_package_name)
+		break
+	except PackageNotFoundError:
+		continue
+else:
+	__version__ = 'unknown'
+
 
 # Type stubs for lazy imports - fixes linter warnings
 if TYPE_CHECKING:
@@ -50,7 +60,7 @@ if TYPE_CHECKING:
 
 	# from browser_use.agent.service import Agent
 	from browser_use.agent.views import ActionModel, ActionResult, AgentHistoryList
-	from browser_use.browser import BrowserProfile, BrowserSession
+	from browser_use.browser import ApiCollectionConfig, BrowserProfile, BrowserSession
 	from browser_use.browser import BrowserSession as Browser
 	from browser_use.dom.service import DomService
 	from browser_use.llm import models
@@ -82,6 +92,7 @@ _LAZY_IMPORTS = {
 	'BrowserSession': ('browser_use.browser', 'BrowserSession'),
 	'Browser': ('browser_use.browser', 'BrowserSession'),  # Alias for BrowserSession
 	'BrowserProfile': ('browser_use.browser', 'BrowserProfile'),
+	'ApiCollectionConfig': ('browser_use.browser', 'ApiCollectionConfig'),
 	# Tools (moderate weight)
 	'Tools': ('browser_use.tools.service', 'Tools'),
 	'Controller': ('browser_use.tools.service', 'Controller'),  # alias
@@ -133,6 +144,7 @@ __all__ = [
 	'BrowserSession',
 	'Browser',  # Alias for BrowserSession
 	'BrowserProfile',
+	'ApiCollectionConfig',
 	'Controller',
 	'DomService',
 	'SystemPrompt',
@@ -157,4 +169,5 @@ __all__ = [
 	'models',
 	# Sandbox execution
 	'sandbox',
+	'__version__',
 ]

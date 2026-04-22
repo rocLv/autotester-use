@@ -2037,9 +2037,7 @@ def run_main_interface(ctx: click.Context, debug: bool = False, **kwargs):
 	"""Run the main browser-use interface"""
 
 	if kwargs['version']:
-		from importlib.metadata import version
-
-		print(version('browser-use'))
+		print(get_browser_use_version())
 		sys.exit(0)
 
 	# Check if MCP server mode is activated
