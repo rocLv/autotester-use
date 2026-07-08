@@ -2,7 +2,7 @@
 name = "autotester-use"
 description = "Browser automation for AI agents with API collection support"
 authors = [{ name = "Gregor Zunic" }]
-version = "0.12.6.post1"
+version = "0.13.3"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11,<4.0"
@@ -46,7 +46,7 @@ dependencies = [
     "cloudpickle==3.1.2",
     "markdownify==1.2.2",
     "python-docx==1.2.0",
-    "browser-use-sdk==3.4.2",
+    "browser-use-sdk==3.8.4",
 ]
 # google-api-core: only used for Google LLM APIs
 # pyperclip: only used for examples that use copy/paste
