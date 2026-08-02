@@ -117,7 +117,14 @@ def api_http_server():
 @pytest.mark.asyncio
 async def test_browser_session_collects_api_schema_to_file(api_http_server, tmp_path):
 	output_path = tmp_path / 'openapi.json'
-	session = BrowserSession(browser_profile=BrowserProfile(headless=True, user_data_dir=None, keep_alive=True))
+	session = BrowserSession(
+		browser_profile=BrowserProfile(
+			headless=True,
+			user_data_dir=None,
+			keep_alive=True,
+			enable_default_extensions=False,
+		)
+	)
 	await session.start()
 
 	try:
@@ -126,6 +133,7 @@ async def test_browser_session_collects_api_schema_to_file(api_http_server, tmp_
 		await asyncio.sleep(0.5)
 
 		exported_path = await session.export_api_schema()
+		assert exported_path is not None
 		schema = json.loads(Path(exported_path).read_text(encoding='utf-8'))
 
 		assert exported_path == output_path

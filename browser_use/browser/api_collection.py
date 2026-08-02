@@ -348,9 +348,10 @@ class ApiSchemaCollector(BaseModel):
 
 	def export(self, path: str | Path | None = None) -> Path | None:
 		"""Write the OpenAPI document to disk."""
-		output_path = Path(path or self.config.output_path).expanduser().resolve() if path or self.config.output_path else None
-		if output_path is None:
+		resolved_path = path if path is not None else self.config.output_path
+		if resolved_path is None:
 			return None
+		output_path = Path(resolved_path).expanduser().resolve()
 		output_path.parent.mkdir(parents=True, exist_ok=True)
 		output_path.write_text(json.dumps(self.to_openapi(), indent=2, ensure_ascii=False), encoding='utf-8')
 		return output_path
