@@ -1,307 +1,412 @@
-<!-- mcp-name: com.browser-use/browser-use -->
-<picture>
-  <source media="(prefers-color-scheme: light)" srcset="https://github.com/user-attachments/assets/2ccdb752-22fb-41c7-8948-857fc1ad7e24">
-  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/774a46d5-27a0-490c-b7d0-e65fcbbfa358">
-  <img alt="Shows a black Browser Use Logo in light color mode and a white one in dark color mode." src="https://github.com/user-attachments/assets/2ccdb752-22fb-41c7-8948-857fc1ad7e24"  width="full">
-</picture>
+<!-- mcp-name: com.roclv/autotester-use -->
+<p align="center">
+  <strong>English</strong> | <a href="README.zh-CN.md">简体中文</a>
+</p>
 
-<div align="center">
-    <picture>
-    <source media="(prefers-color-scheme: light)" srcset="https://github.com/user-attachments/assets/9955dda9-ede3-4971-8ee0-91cbc3850125">
-    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/6797d09b-8ac3-4cb9-ba07-b289e080765a">
-    <img alt="The AI browser agent." src="https://github.com/user-attachments/assets/9955dda9-ede3-4971-8ee0-91cbc3850125"  width="400">
-    </picture>
-</div>
+# AutoTester Use
 
-<div align="center">
-<a href="https://cloud.browser-use.com?utm_source=github&utm_medium=readme-badge-downloads"><img src="https://media.browser-use.tools/badges/package" height="48" alt="Browser-Use Package Download Statistics"></a>
-</div>
+**A Web UI QA agent that turns natural-language test cases into typed specifications, executes one business step at a time, and distinguishes product defects from AI execution failures.**
 
----
+AutoTester Use changes the default `browser_use.Agent` from a general task-completion agent into a Web UI QA runner. A run is successful only when the observable expectation of every business step is satisfied—not merely when the model says that it finished.
 
-<div align="center">
-<a href="#what-can-browser-use-do"><img src="https://media.browser-use.tools/badges/demos" alt="Demos"></a>
-<img width="16" height="1" alt="">
-<a href="https://docs.browser-use.com"><img src="https://media.browser-use.tools/badges/docs" alt="Docs"></a>
-<img width="16" height="1" alt="">
-<a href="https://browser-use.com/posts"><img src="https://media.browser-use.tools/badges/blog" alt="Blog"></a>
-<img width="16" height="1" alt="">
-<a href="https://browsermerch.com"><img src="https://media.browser-use.tools/badges/merch" alt="Merch"></a>
-<img width="100" height="1" alt="">
-<a href="https://github.com/browser-use/browser-use"><img src="https://media.browser-use.tools/badges/github" alt="Github Stars"></a>
-<img width="4" height="1" alt="">
-<a href="https://x.com/intent/user?screen_name=browser_use"><img src="https://media.browser-use.tools/badges/twitter" alt="Twitter"></a>
-<img width="4" height="1" alt="">
-<a href="https://link.browser-use.com/discord"><img src="https://media.browser-use.tools/badges/discord" alt="Discord"></a>
-<img width="4" height="1" alt="">
-<a href="https://cloud.browser-use.com?utm_source=github&utm_medium=readme-badge-cloud"><img src="https://media.browser-use.tools/badges/cloud" height="48" alt="Browser-Use Cloud"></a>
-</div>
+This QA behavior applies only to the default `browser_use.Agent`. `browser_use.beta.Agent` retains its existing behavior.
 
-</br>
+## Why use it?
 
-# What can Browser Use do?
+- Compile a natural-language Task into a Pydantic `WebUITestCase` and print it as a Markdown table.
+- Preserve explicit requirements with verified source quotes and character ranges.
+- Judge every business step independently from objective browser evidence.
+- Distinguish `SUT_FAILED`, `AGENT_FAILED`, `BLOCKED`, and `INCONCLUSIVE`.
+- Require a runner-owned `ActionReceipt` and resolvable evidence IDs for reliable verdicts.
+- Independently review every proposed product defect before reporting it.
+- Reuse the compiled case and same-domain login state by default.
+- Save versioned QA Bundles and replay reliable traces across processes.
+- Run strict deterministic replay with zero LLM calls.
+- Export JSON, JUnit XML, and self-contained HTML reports.
+- Restrict interactive pages, tabs, and popups to the Task's registrable domain.
 
-Browser Use lets an AI agent use a web browser the same way you do — it opens pages, clicks buttons, types, and fills in forms. You describe the task, and it completes it. For example, you can have it:
+## Installation
 
-
-### 📋 Fill Forms
-#### Task: "Fill in this job application with my resume and information."
-
-![Job Application Demo](https://github.com/user-attachments/assets/57865ee6-6004-49d5-b2c2-6dff39ec2ba9)
-
-[Example code ↗](https://github.com/browser-use/browser-use/blob/main/examples/use-cases/apply_to_job.py)
-
-
-### 🍎 Extract data
-#### Task: "Extract structured data about my followers and export it as a CSV."
-
-https://github.com/user-attachments/assets/93714c75-98f4-4cfc-add1-69c38b5138b5
-
-[Browser Use Cloud Docs ↗](https://docs.browser-use.com/cloud/quickstart)
-
-
-### 💻 QA Automation
-#### Task: "QA test my local website and report any bugs, usability issues, and visual inconsistencies."
-
-<img width="1920" height="1080" alt="qa-demo-small" src="https://github.com/user-attachments/assets/bf590697-df9c-4e79-b646-d6f52bfea976" />
-
-[Browser Use CLI ↗](https://docs.browser-use.com/open-source/browser-use-cli)
-
-
-<br/>
-
-# Quickstart
-
-If you want to use Browser Use in your agent (Claude Code, Codex, Cursor, Hermes, OpenClaw, etc.), paste this prompt, and it sets everything up itself:
-
-```text
-Install or upgrade browser-use to the latest stable version with uv using Python 3.12, run `browser-use skill install` to register the skill, and connect it to my browser. If setup or connection fails, follow https://github.com/browser-use/browser-harness/blob/main/install.md.
-```
-
-Then tell your agent what you want done.
-
-<br/>
-
-# Python library: the easiest way to automate the web
-
-Want to automate the web at scale, from your own code, and with any LLM? Use the Python library:
-
-**1. Install Browser Use (Python >= 3.11):**
+Python 3.11 or newer is required.
 
 ```bash
 uv add autotester-use
-# or: pip install autotester-use
+uv run autotester-use install
 ```
 
-**2. Add your LLM API key to `.env`**. Get one from [Browser Use Cloud](https://cloud.browser-use.com/new-api-key?utm_source=github&utm_medium=readme-quickstart-api-key), or bring your own provider key:
+If you want Codex, Claude Code, Cursor, or another coding agent to use the packaged browser skill, run `autotester-use skill install` to register the skill.
+
+For development from this repository:
+
+```bash
+uv sync
+```
+
+Configure an LLM. `ChatBrowserUse` is the recommended default for browser automation:
 
 ```bash
 # .env
 BROWSER_USE_API_KEY=your-key
-# GOOGLE_API_KEY=your-key
-# ANTHROPIC_API_KEY=your-key
 ```
 
-**3. Run your first agent:**
+AutoTester Use does not restrict model names. You can explicitly pass any model supported by the installed SDK.
+
+## Complete runnable QA demo
+
+This example uses the existing public Halo website. It compiles the Task with an LLM, verifies the article list, prints the typed case table, writes three report formats and a QA Bundle, then performs a strict zero-LLM replay when the first run produced a reliable pass.
 
 ```python
 import asyncio
 
-from browser_use import Agent, ChatBrowserUse
+from dotenv import load_dotenv
 
-async def main():
-    agent = Agent(
-        task="Find the number of stars of the browser-use repo",
-        llm=ChatBrowserUse(model='openai/gpt-5.5'),
-        # llm=ChatBrowserUse(model='bu-2-0'),  # Browser Use's optimized model
-        # llm=ChatOpenAI(model='gpt-5.5'),
-        # llm=ChatAnthropic(model='claude-opus-4-8'),  # Sonnet also works well
+from browser_use import (
+    Agent,
+    BrowserProfile,
+    BrowserSession,
+    ChatBrowserUse,
+    QARunStatus,
+)
+
+load_dotenv()
+
+HALO_URL = "https://demo.halocms.site/console"
+HALO_DOMAIN = "demo.halocms.site"
+
+TASK = f"""
+Open {HALO_URL} and test the Halo article list.
+
+Precondition: If the login page is displayed, sign in with username demo and
+the sensitive value HALO_PASSWORD, then enter the administration console.
+
+Business step:
+1. Click "Articles" in the sidebar.
+   Expected result: The article list is displayed and a "New" entry is visible.
+"""
+
+
+async def main() -> None:
+    browser = BrowserSession(
+        browser_profile=BrowserProfile(
+            headless=True,
+            keep_alive=True,
+            user_data_dir=None,
+            allowed_domains=[HALO_DOMAIN],
+        )
     )
-    history = await agent.run()
+    agent = Agent(
+        task=TASK,
+        llm=ChatBrowserUse(),
+        browser=browser,
+        sensitive_data={
+            HALO_DOMAIN: {
+                "HALO_PASSWORD": "P@ssw0rd123..",
+            }
+        },
+        max_agent_retries_per_step=3,
+        reuse_compiled_test_case=True,
+        reuse_login_state=True,
+    )
+
+    try:
+        history = await agent.run(max_steps=30)
+        result = history.qa_result
+        if result is None:
+            raise RuntimeError("Agent returned no qa_result")
+
+        if result.test_case:
+            print(result.test_case.to_markdown_table())
+        print(result.model_dump_json(indent=2))
+
+        agent.save_qa_report("./artifacts/halo-run.json")
+        agent.save_qa_report("./artifacts/halo-junit.xml")
+        agent.save_qa_report("./artifacts/halo-report.html")
+        agent.save_qa_bundle("./artifacts/halo.qa-bundle")
+
+        if result.status == QARunStatus.PASSED and result.has_reliable_verdict:
+            replay_history = await agent.rerun(
+                max_steps=30,
+                mode="replay",
+                allow_llm_fallback=False,
+            )
+            replay_result = replay_history.qa_result
+            assert replay_result is not None
+            assert replay_result.llm_call_count == 0
+            print(replay_result.model_dump_json(indent=2))
+    finally:
+        await browser.kill()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-Check out the [library docs](https://docs.browser-use.com/open-source/introduction) and the [cloud docs](https://docs.cloud.browser-use.com?utm_source=github&utm_medium=readme-cloud-docs) for more!
+The public demo may reset its data or credentials. Replace the URL, Task, and `sensitive_data` with your own test environment for stable CI.
 
-<br/>
+Repository demos:
 
-# Open Source vs Cloud
+```bash
+# Four-step article publishing case. This creates real data.
+uv run python examples/qa/halo_article_publish_qa.py
 
-<picture>
-  <source media="(prefers-color-scheme: light)" srcset="static/accuracy_by_model_light.png">
-  <source media="(prefers-color-scheme: dark)" srcset="static/accuracy_by_model_dark.png">
-  <img alt="BU Bench V1 - LLM Success Rates" src="static/accuracy_by_model_light.png" width="100%">
-</picture>
+# Safe read-only AI run followed by replay and timing comparison.
+uv run python examples/qa/halo_article_publish_qa.py --compare-rerun
 
-We benchmark Browser Use across 100 real-world browser tasks. Full benchmark is open source: **[browser-use/benchmark](https://github.com/browser-use/benchmark)**.
+# Fixed-DOM performance ceiling with no Agent and no LLM.
+uv run python examples/qa/halo_no_llm_baseline.py
 
-Browser Use is also **#1 on the [Odysseys leaderboard](https://odysseysbench.com/leaderboard)** with an 87.4% average, ahead of computer-use agents from OpenAI, Anthropic, Google, and Microsoft. Odysseys measures the agent's performance on 200 long-horizon web tasks.
-
-**Use the Open-Source Agent**
-- Free, and runs on your own machine
-- Deep code-level integration and control: pick your LLM, customize the agent's behavior
-- We recommend pairing it with our [cloud browsers](https://docs.browser-use.com/open-source/customize/browser/remote) for leading stealth, proxy rotation, and scaling
-
-**Use the [Fully-Hosted Cloud Agent](https://cloud.browser-use.com?utm_source=github&utm_medium=readme-hosted-agent) (recommended)**
-- Much more powerful agent for complex tasks (see plot above)
-- Easiest way to start and scale
-- Best stealth with proxy rotation and captcha solving
-- 1000+ integrations (Gmail, Slack, Notion, and more)
-- Persistent filesystem and memory
-
-<br/>
-
-## Integrations, hosting, custom tools, MCP, and more on our [Docs ↗](https://docs.browser-use.com)
-
-<br/>
-
-# FAQ
-
-<details>
-<summary><b>Should I use the CLI vs. the Python library?</b></summary>
-
-**Use the CLI** if you already have an agent (Claude Code, Codex, Cursor, Hermes, OpenClaw, etc.) that you want to complete browser tasks for you. The agent installs the skill once (see [Quickstart](#quickstart)) and can then control the browser. Examples:
-- "Upload this video to YouTube"
-- "Compare these three laptops and give me a table with prices"
-- "Fill in this job application with my resume"
-
-**Use the Python library** when you are building software that automates the web. Examples:
-- Run many tasks on a schedule or in parallel (scraping, monitoring, QA)
-- Embed a browser agent into your own product
-- Custom tools, custom system prompts, structured output, fine-grained browser control
-
-Rule of thumb: one-off tasks through an agent → CLI. Repeatable automation in code → Python library.
-</details>
-
-<details>
-<summary><b>What's the best model to use?</b></summary>
-
-We optimized **ChatBrowserUse()** specifically for browser automation tasks. On avg it completes tasks 3-5x faster than other models with SOTA accuracy.
-
-For pricing and other LLM providers, see our [supported models documentation](https://docs.browser-use.com/supported-models).
-</details>
-
-<details>
-<summary><b>Can I use Claude / GPT / Gemini through ChatBrowserUse?</b></summary>
-
-Yes. `ChatBrowserUse` accepts provider-prefixed model ids, so a single `BROWSER_USE_API_KEY` reaches all of them — no separate OpenAI/Anthropic/Google keys required:
-
-```python
-from browser_use import Agent, ChatBrowserUse
-
-llm = ChatBrowserUse(model='anthropic/claude-sonnet-4-6')  # or 'openai/gpt-5.5', 'google/gemini-3-pro'
-agent = Agent(task='...', llm=llm)
+# Show the browser while running either Halo script.
+uv run python examples/qa/halo_article_publish_qa.py --headed
 ```
 
-For the best speed and cost we still recommend the default `bu-*` models.
-</details>
+## Task contract
 
-<details>
-<summary><b>Should I use the Browser Use system prompt with the open-source preview model?</b></summary>
+Every Task passed to the default `browser_use.Agent` must:
 
-Yes. If you use `ChatBrowserUse(model='browser-use/bu-30b-a3b-preview')` with a normal `Agent(...)`, Browser Use still sends its default agent system prompt for you.
+- contain an explicit HTTP(S) start URL;
+- describe business steps rather than only low-level browser calls;
+- provide an observable expected result for each step whenever possible;
+- describe login, roles, test data, and dependencies as preconditions; and
+- stay within one registrable domain for all interactive pages.
 
-You do **not** need to add a separate custom "Browser Use system message" just because you switched to the open-source preview model. Only use `extend_system_message` or `override_system_message` when you intentionally want to customize the default behavior for your task.
-
-If you want the best default speed/accuracy, we still recommend the newer hosted `bu-*` models. If you want the open-source preview model, the setup stays the same apart from the `model=` value.
-</details>
-
-<details>
-<summary><b>Can I use custom tools with the agent?</b></summary>
-
-Yes! You can add custom tools to extend the agent's capabilities:
+The model compiles the Task into a strongly typed document before formal execution. Explicit wording is verified against the original Task or `ground_truth`; the model cannot invent a requirement quote. If an expected result is missing, AutoTester Use can perform read-only discovery in a disposable CDP BrowserContext and mark the inferred source as `ui_contract` or `heuristic`.
 
 ```python
-from browser_use import Tools
+result = history.qa_result
+assert result is not None
 
-tools = Tools()
+if result.test_case:
+    print(result.test_case.to_markdown_table())
+```
 
-@tools.action(description='Description of what this tool does.')
-def custom_tool(param: str) -> str:
-    return f"Result: {param}"
+The generated table includes the root URL, registrable domain, typed preconditions, operation kind, side-effect level, idempotency key, expected result, expectation source, and verified requirement references.
 
-agent = Agent(
-    task="Your task",
-    llm=llm,
-    browser=browser,
-    tools=tools,
+Expectation sources have different authority:
+
+| Source | Meaning | Can directly support `SUT_FAILED`? |
+| --- | --- | --- |
+| `explicit` | Directly stated in the Task or `ground_truth` | Yes |
+| `ui_contract` | Supported by labels, ARIA, HTML validation, or another observable UI contract | Yes |
+| `heuristic` | Model inference without a reliable contract | No; use `INCONCLUSIVE` |
+
+## Reliable verdicts and failure attribution
+
+Every result uses `schema_version=2` and is available through `history.qa_result`.
+
+| Status | Origin | Meaning |
+| --- | --- | --- |
+| `PASSED` | `none` | The intended actions completed and every reliable expectation was met. |
+| `SUT_FAILED` | `sut` | The intended action completed, a reliable expectation was not met, and independent review agreed. |
+| `AGENT_FAILED` | `agent` | The AI selected the wrong target, omitted an action, exhausted safe retries, or a required model failed. |
+| `BLOCKED` | `environment` | Credentials, role, CAPTCHA, browser/CDP, network, test data, or URL policy blocked execution. |
+| `INCONCLUSIVE` | `unknown` | Evidence was weak, missing, conflicting, or the expectation was only heuristic. |
+| `INVALID_SPEC` | — | The URL or typed test structure was invalid; formal browser execution did not start. |
+
+`history.is_successful()` deliberately preserves the difference between product and execution failures:
+
+```python
+history.is_successful()  # PASSED -> True; SUT_FAILED -> False; otherwise -> None
+```
+
+A reliable pass or product failure requires:
+
+1. an `ActionReceipt` built by the runner from actual tool results;
+2. at least one resolvable `evidence_id`;
+3. a completed intended action;
+4. a reliable `explicit` or `ui_contract` expectation for product failures; and
+5. an independent second review for every proposed `SUT_FAILED`.
+
+The Judge cannot change the receipt's action-completion status. Reviewer failure or disagreement never remains a product-defect verdict.
+
+Inspect the attribution directly:
+
+```python
+for step_result in result.step_results:
+    print(step_result.step.step_id, step_result.status)
+    print(step_result.attempt_receipts)
+    if step_result.judgement:
+        print(step_result.judgement.failure_origin)
+        print(step_result.judgement.failure_code)
+        print(step_result.judgement.evidence_ids)
+    if step_result.review:
+        print(step_result.review.agreed, step_result.review.reason)
+```
+
+Execution stops at the first reliable non-pass outcome. Remaining business steps are recorded as `NOT_RUN` to avoid cascading defect reports.
+
+## Preconditions, login reuse, and side effects
+
+Preconditions are typed as:
+
+- `VERIFY`: inspect a role, page state, dependency, or test-data condition without changing it;
+- `ENSURE`: perform an explicitly allowed setup action such as login, separately from business steps.
+
+Required preconditions that cannot be satisfied produce `BLOCKED`, not `SUT_FAILED`. Login state is retained by default only for the current Agent and navigation scope. It is revalidated before reuse and is not copied to another registrable domain.
+
+Side-effecting operations receive a run-scoped idempotency key. When a submit, publish, delete, payment, or similar action may already have taken effect, AutoTester Use gathers more evidence instead of blindly retrying. If the effect remains uncertain, the result is `INCONCLUSIVE`.
+
+Cleanup is optional and recorded separately. Cleanup failure becomes a warning and never overwrites the business verdict.
+
+## Rerun and replay modes
+
+```python
+# Reuse the compiled test case and login state, but execute and judge with AI again.
+ai_rerun = await agent.rerun(mode="ai")
+
+# Replay deterministic actions; use AI only when a target or observation drifts.
+adaptive_replay = await agent.rerun(mode="replay")
+
+# Strict replay: guaranteed zero LLM calls.
+strict_replay = await agent.rerun(
+    mode="replay",
+    allow_llm_fallback=False,
 )
 ```
 
-</details>
+| Mode | LLM behavior | Recommended use |
+| --- | --- | --- |
+| `mode="ai"` | Executor, Judge, and required review calls remain | New or highly dynamic UI |
+| `mode="replay"` | Zero LLM while the trace matches; audited fallback for only the drifted step | Fast adaptive regression |
+| strict replay | Always zero LLM; drift cannot fall back | Stable UI, deterministic CI, cost ceilings |
 
-<details>
-<summary><b>Can I use this for free?</b></summary>
+Replay fallback is allowed only when the target drifted, the recorded action cannot be replayed, or required evidence is no longer observable. If the action completed and a reliable assertion is observably false, the normal product-verdict path runs immediately; AI fallback cannot hide a product defect.
 
-Yes! Browser-Use is open source and free to use. You only need to choose an LLM provider (like OpenAI, Google, ChatBrowserUse, or run local models with Ollama).
-</details>
+Every result records `requested_mode`, `effective_mode`, fallback warnings, `llm_call_count`, and phase timings.
 
-<details>
-<summary><b>Terms of Service</b></summary>
+## Versioned QA Bundles and cross-process replay
 
-This open-source library is licensed under the MIT License. For Browser Use services & data policy, see our [Terms of Service](https://browser-use.com/legal/terms-of-service) and [Privacy Policy](https://browser-use.com/privacy/).
-</details>
+A QA Bundle is a local checksummed directory containing:
 
-<details>
-<summary><b>How do I handle authentication?</b></summary>
-
-Check out our authentication examples:
-- [Using real browser profiles](https://github.com/browser-use/browser-use/blob/main/examples/browser/real_browser.py) - Reuse your existing Chrome profile with saved logins
-- If you want to use temporary accounts with inbox, choose AgentMail
-- To sync your auth profile with the remote browser, run `curl -fsSL https://browser-use.com/profile.sh | BROWSER_USE_API_KEY=XXXX sh` (replace XXXX with your API key)
-
-These examples show how to maintain sessions and handle authentication seamlessly.
-</details>
-
-<details>
-<summary><b>How do I solve CAPTCHAs?</b></summary>
-
-For CAPTCHA handling, you need better browser fingerprinting and proxies. Use [Browser Use Cloud](https://cloud.browser-use.com?utm_source=github&utm_medium=readme-faq-captcha) which provides stealth browsers designed to avoid detection and CAPTCHA challenges.
-</details>
-
-<details>
-<summary><b>How do I go into production?</b></summary>
-
-Chrome can consume a lot of memory, and running many agents in parallel can be tricky to manage.
-
-For production use cases, use our [Browser Use Cloud API](https://cloud.browser-use.com?utm_source=github&utm_medium=readme-faq-production) which handles:
-- Scalable browser infrastructure
-- Memory management
-- Proxy rotation
-- Stealth browser fingerprinting
-- High-performance parallel execution
-</details>
-
-<br/>
-
-## Citation
-
-If you use Browser Use in your research or project, please cite:
-
-```bibtex
-@software{browser_use2024,
-  author = {Müller, Magnus and Žunič, Gregor},
-  title = {Browser Use: Enable AI to control your browser},
-  year = {2024},
-  publisher = {GitHub},
-  url = {https://github.com/browser-use/browser-use}
-}
+```text
+manifest.json
+test_case.json
+run_result.json
+actions/<step_id>.json
+artifacts/<evidence_id>.*
 ```
 
-<br/>
+Save and load a bundle:
 
-<div align="center">
+```python
+from browser_use import Agent, ChatBrowserUse, QABundle
 
-**Tell your computer what to do, and it gets it done.**
+bundle = agent.save_qa_bundle("./artifacts/halo.qa-bundle")
 
-<img src="https://github.com/user-attachments/assets/06fa3078-8461-4560-b434-445510c1766f" width="400"/>
+# In a later process. Configure persistent authentication separately when needed.
+fresh_agent = Agent(task=TASK, llm=ChatBrowserUse())
+strict_history = await fresh_agent.rerun(
+    mode="replay",
+    bundle=QABundle.load(bundle.path),
+    allow_llm_fallback=False,
+)
+```
 
-[![Twitter Follow](https://img.shields.io/twitter/follow/Magnus?style=social)](https://x.com/intent/user?screen_name=mamagnus00)
-&emsp;&emsp;&emsp;
-[![Twitter Follow](https://img.shields.io/twitter/follow/Gregor?style=social)](https://x.com/intent/user?screen_name=gregpr07)
+Loading rejects checksum damage, incompatible schemas, an unverified legacy result, Task or `ground_truth` mismatch, root URL mismatch, and registrable-domain mismatch before formal business-step execution. AI-repaired traces are appended as immutable revisions only after a reliable pass.
 
-</div>
+Bundles do not store reusable secrets. For authenticated cross-process replay, configure a persistent `user_data_dir`, an existing browser profile, or a hosted browser profile.
 
-<div align="center"> Made with ❤️ in Zurich and San Francisco </div>
+## Reports
+
+```python
+agent.save_qa_report("./reports/run.json")
+agent.save_qa_report("./reports/junit.xml")
+agent.save_qa_report("./reports/run.html")
+```
+
+JUnit mapping:
+
+- `SUT_FAILED` → test failure;
+- `AGENT_FAILED`, `BLOCKED`, `INCONCLUSIVE`, `INVALID_SPEC` → execution error;
+- `NOT_RUN` → skipped.
+
+The HTML report includes typed steps, before/after evidence, action receipts, independent reviews, cleanup outcomes, phase timings, and redacted diagnostics. Sensitive values, cookies, authorization headers, and response bodies are not written as raw evidence.
+
+## Pass an already typed test case
+
+Use `qa_test_case` to skip natural-language compilation when the caller owns a validated specification. Explicit expectations still need an exact source reference.
+
+```python
+from browser_use import Agent, ChatBrowserUse, WebUITestCase, WebUITestStep
+from browser_use.qa import (
+    ExpectationSource,
+    RequirementReference,
+    RequirementSource,
+    SideEffectLevel,
+    StepOperationKind,
+)
+
+TASK = """Open https://example.com and run one test step.
+Step: Inspect the page heading.
+Expected result: The heading Example Domain is visible."""
+REQUIREMENT = "Expected result: The heading Example Domain is visible."
+start = TASK.index(REQUIREMENT)
+
+test_case = WebUITestCase(
+    root_url="https://example.com",
+    registrable_domain="example.com",
+    steps=[
+        WebUITestStep(
+            step_id="heading_visible",
+            instruction="Inspect the page heading.",
+            expected_result="The heading Example Domain is visible.",
+            expectation_source=ExpectationSource.EXPLICIT,
+            operation_kind=StepOperationKind.OBSERVE,
+            side_effect_level=SideEffectLevel.NONE,
+            requirement_references=[
+                RequirementReference(
+                    source=RequirementSource.TASK,
+                    quote=REQUIREMENT,
+                    start=start,
+                    end=start + len(REQUIREMENT),
+                )
+            ],
+        )
+    ],
+)
+
+agent = Agent(task=TASK, qa_test_case=test_case, llm=ChatBrowserUse())
+```
+
+The Task start URL and registrable domain must match the supplied case.
+
+## URL safety
+
+- The Task must contain one explicit HTTP(S) start URL.
+- The start URL's registrable domain and its subdomains form the maximum navigation scope.
+- Caller-provided `allowed_domains` and `prohibited_domains` can only narrow that scope.
+- Requested navigation, final redirects, newly created tabs, popups, and SPA URL changes are checked.
+- `localhost` and IP addresses use exact-host matching.
+- Credentials in URLs and interactive `data:`, `blob:`, `file:`, or `chrome:` pages are rejected.
+- Cross-domain XHR, API, CDN, image, and other subresources remain available and can contribute evidence.
+
+`use_judge=False` and non-empty `initial_actions` are rejected by the default QA Agent. `max_agent_retries_per_step` accepts `0..3` and defaults to `3`.
+
+## Performance guidance
+
+- Use `headless=True` for CI and batch execution; use headed mode for debugging and visual observation.
+- Keep `reuse_compiled_test_case=True` to skip unchanged Task compilation.
+- Keep `reuse_login_state=True` to avoid repeated login within the same Agent and domain.
+- Use strict replay for stable regression paths that need zero LLM cost.
+- Use `use_vision=False` only when URL and semantic DOM evidence are sufficient.
+- Inspect `result.phase_timings` instead of relying on total wall-clock time alone.
+- For production browser performance, `Browser(use_cloud=True)` provisions a hosted browser optimized for automation and requires `BROWSER_USE_API_KEY`.
+
+The fixed-DOM script in `examples/qa/halo_no_llm_baseline.py` is an optimization ceiling, not a general QA agent: it is faster because it gives up natural-language compilation, semantic adaptation, independent model judgment, and generic failure attribution.
+
+## Development
+
+```bash
+uv sync
+uv run pytest tests/ci/qa
+uv run pre-commit run --all-files
+```
+
+## Documentation and license
+
+- [Chinese README](README.zh-CN.md)
+- [Complete Halo QA demo](examples/qa/halo_article_publish_qa.py)
+- [Zero-LLM fixed-DOM baseline](examples/qa/halo_no_llm_baseline.py)
+- [Upstream browser automation documentation](https://docs.browser-use.com)
+- [Hosted browser service](https://cloud.browser-use.com)
+
+AutoTester Use is licensed under the MIT License. Linked hosted services have their own terms and privacy policies.

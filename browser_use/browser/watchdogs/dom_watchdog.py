@@ -80,6 +80,12 @@ class DOMWatchdog(BaseWatchdog):
 					event_data['url'] = getattr(event, 'url')
 				if hasattr(event, 'error_message'):
 					event_data['error_message'] = getattr(event, 'error_message')
+				if hasattr(event, 'message'):
+					event_data['message'] = getattr(event, 'message')
+				if hasattr(event, 'error_type'):
+					event_data['error_type'] = getattr(event, 'error_type')
+				if hasattr(event, 'details'):
+					event_data['details'] = getattr(event, 'details')
 				if hasattr(event, 'target_id'):
 					event_data['target_id'] = getattr(event, 'target_id')
 				recent_events_data.append(event_data)

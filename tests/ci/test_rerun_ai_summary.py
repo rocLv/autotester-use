@@ -1055,10 +1055,10 @@ async def test_wait_for_minimum_elements(httpserver):
 
 
 async def test_rerun_waits_for_elements_before_matching(httpserver):
-	"""Test that rerun_history waits for elements before attempting element matching.
+	"""Test that rerun_history waits for the saved target before element matching.
 
-	This test verifies that for actions needing element matching (like click),
-	the rerun logic waits for the page to have enough elements before proceeding.
+	The historical numeric index is intentionally larger than the current selector map;
+	target-aware readiness must proceed as soon as the stable saved element matches.
 	"""
 	from browser_use.dom.views import DOMInteractedElement
 
@@ -1097,7 +1097,7 @@ async def test_rerun_waits_for_elements_before_matching(httpserver):
 	# Create an element that matches the page
 	button_element = DOMInteractedElement(
 		node_id=1,
-		backend_node_id=5,  # This will trigger waiting for at least 5 elements
+		backend_node_id=5,
 		frame_id=None,
 		node_type=NodeType.ELEMENT_NODE,
 		node_value='',
@@ -1132,7 +1132,7 @@ async def test_rerun_waits_for_elements_before_matching(httpserver):
 		),
 	)
 
-	# Step 2: Click button (needs element matching, should wait for elements)
+	# Step 2: Click button (saved index 5, but only the target itself must be present)
 	click_step = AgentHistory(
 		model_output=AgentOutput(
 			evaluation_previous_goal=None,
@@ -1158,7 +1158,7 @@ async def test_rerun_waits_for_elements_before_matching(httpserver):
 	history = AgentHistoryList(history=[navigate_step, click_step])
 
 	try:
-		# Run rerun with wait_for_elements=True - should wait for elements before trying to match
+		# Run rerun with wait_for_elements=True - should wait for the saved target before matching
 		results = await agent.rerun_history(
 			history,
 			skip_failures=True,

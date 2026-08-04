@@ -1,8 +1,8 @@
 [project]
 name = "autotester-use"
-description = "Browser automation for AI agents with API collection support"
+description = "AI-driven Web UI QA with typed test cases, reliable verdicts, and deterministic replay"
 authors = [{ name = "Gregor Zunic" }]
-version = "0.13.7"
+version = "0.13.8"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11,<4.0"
@@ -28,6 +28,7 @@ dependencies = [
     "requests==2.33.0",
     "screeninfo==0.8.1; platform_system != 'darwin'",
     "typing-extensions==4.15.0",
+    "tldextract==5.3.0",
     "uuid7==0.1.0",
     "google-genai==1.65.0",
     "openai==2.16.0",
@@ -94,9 +95,10 @@ all = ["autotester-use[cli,examples,aws,oci]"]
 
 
 [project.urls]
-Homepage = "https://browser-use.com"
-Documentation = "https://docs.browser-use.com"
+Homepage = "https://github.com/rocLv/autotester-use"
+Documentation = "https://github.com/rocLv/autotester-use#readme"
 Repository = "https://github.com/rocLv/autotester-use"
+"Upstream Documentation" = "https://docs.browser-use.com"
 Telemetry = "https://docs.browser-use.com/development/monitoring/telemetry"
 "Terms of Service" = "https://browser-use.com/legal/terms-of-service"
 "Privacy Policy" = "https://browser-use.com/privacy/"

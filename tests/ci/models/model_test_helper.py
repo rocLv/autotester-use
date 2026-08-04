@@ -7,6 +7,16 @@ import pytest
 from browser_use.agent.service import Agent
 from browser_use.browser.profile import BrowserProfile
 from browser_use.browser.session import BrowserSession
+from browser_use.qa.compiler import QATaskCompiler
+from browser_use.qa.views import (
+	ExpectationSource,
+	QARunStatus,
+	SideEffectLevel,
+	StepOperationKind,
+	WebUITestCase,
+	WebUITestStep,
+)
+from tests.ci.qa.test_qa_agent_integration import _qa_llm
 
 
 async def run_model_button_click_test(
@@ -22,7 +32,7 @@ async def run_model_button_click_test(
 	1. Model can be initialized with API key
 	2. Agent can navigate and click a button
 	3. Button click is verified by checking page state change
-	4. Completes within max 2 steps
+	4. The independent QA judge confirms the expected state within max 2 executor steps
 	"""
 	# Handle API key validation - skip test if not available
 	if api_key_env is not None:
@@ -79,30 +89,48 @@ async def run_model_button_click_test(
 
 		# Create agent with button click task (URL in task triggers auto-navigation)
 		test_url = httpserver.url_for('/')
+		task = f'Open {test_url}. Click the “Click Me” button. Expected: the result displays SUCCESS.'
+		scope = QATaskCompiler.resolve_scope(task)
+		test_case = WebUITestCase(
+			root_url=test_url,
+			registrable_domain=scope.registrable_domain,
+			steps=[
+				WebUITestStep(
+					step_id='click-button',
+					instruction='Click the “Click Me” button',
+					expected_result='The result displays SUCCESS',
+					expectation_source=ExpectationSource.EXPLICIT,
+					operation_kind=StepOperationKind.CLICK,
+					side_effect_level=SideEffectLevel.REVERSIBLE,
+					source_evidence=['Expected: the result displays SUCCESS.'],
+				)
+			],
+		)
 		agent = Agent(
-			task=f'{test_url} - Click the button',
+			task=task,
 			llm=llm,
+			judge_llm=_qa_llm(),
 			browser_session=browser,
-			max_steps=2,  # Max 2 steps as per requirements
+			qa_test_case=test_case,
 		)
 
 		# Run the agent
-		result = await agent.run()
+		result = await agent.run(max_steps=2)
 
 		# Verify task completed
 		assert result is not None
 		assert len(result.history) > 0
 
-		# Verify button was clicked by checking page state across any step
-		button_clicked = False
-		for step in result.history:
-			# Check state_message which contains browser state with page text
-			if step.state_message and 'SUCCESS' in step.state_message:
-				button_clicked = True
-				break
-
-		# Check if SUCCESS appears in any step (indicating button was clicked)
-		assert button_clicked, 'Button was not clicked - SUCCESS not found in any page state'
+		assert result.qa_result is not None
+		external_unavailability = ('User location is not supported', 'credit_balance_exhausted', 'insufficient_quota')
+		if result.qa_result.status == QARunStatus.AGENT_FAILED and any(
+			marker in (error or '') for error in result.errors() for marker in external_unavailability
+		):
+			pytest.skip('Model provider is externally unavailable for this configured credential or region')
+		assert any(step.state_message and 'SUCCESS' in step.state_message for step in result.history), (
+			'Button was not clicked - SUCCESS not found in recorded page state'
+		)
+		assert result.qa_result.status == QARunStatus.PASSED
 
 	finally:
 		# Clean up browser session

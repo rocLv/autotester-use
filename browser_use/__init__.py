@@ -73,6 +73,17 @@ if TYPE_CHECKING:
 	from browser_use.llm.ollama.chat import ChatOllama
 	from browser_use.llm.openai.chat import ChatOpenAI
 	from browser_use.llm.vercel.chat import ChatVercel
+	from browser_use.qa import (
+		ActionReceipt,
+		EvidenceArtifact,
+		QABundle,
+		QAPrecondition,
+		QARunResult,
+		QARunStatus,
+		RequirementReference,
+		WebUITestCase,
+		WebUITestStep,
+	)
 	from browser_use.sandbox import sandbox
 	from browser_use.tools.service import Controller, Tools
 
@@ -90,6 +101,15 @@ _LAZY_IMPORTS = {
 	'Browser': ('browser_use.browser', 'BrowserSession'),  # Alias for BrowserSession
 	'BrowserProfile': ('browser_use.browser', 'BrowserProfile'),
 	'ApiCollectionConfig': ('browser_use.browser', 'ApiCollectionConfig'),
+	'ActionReceipt': ('browser_use.qa', 'ActionReceipt'),
+	'EvidenceArtifact': ('browser_use.qa', 'EvidenceArtifact'),
+	'QAPrecondition': ('browser_use.qa', 'QAPrecondition'),
+	'QABundle': ('browser_use.qa', 'QABundle'),
+	'QARunResult': ('browser_use.qa', 'QARunResult'),
+	'QARunStatus': ('browser_use.qa', 'QARunStatus'),
+	'RequirementReference': ('browser_use.qa', 'RequirementReference'),
+	'WebUITestCase': ('browser_use.qa', 'WebUITestCase'),
+	'WebUITestStep': ('browser_use.qa', 'WebUITestStep'),
 	# Tools (moderate weight)
 	'Tools': ('browser_use.tools.service', 'Tools'),
 	'Controller': ('browser_use.tools.service', 'Controller'),  # alias
@@ -142,6 +162,15 @@ __all__ = [
 	'Browser',  # Alias for BrowserSession
 	'BrowserProfile',
 	'ApiCollectionConfig',
+	'ActionReceipt',
+	'EvidenceArtifact',
+	'QABundle',
+	'QAPrecondition',
+	'QARunResult',
+	'QARunStatus',
+	'RequirementReference',
+	'WebUITestCase',
+	'WebUITestStep',
 	'Controller',
 	'DomService',
 	'SystemPrompt',

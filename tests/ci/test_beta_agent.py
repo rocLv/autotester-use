@@ -165,7 +165,6 @@ def test_beta_agent_runtime_signatures_match_browser_use_callable_surface():
 def test_beta_agent_constructor_type_hints_match_browser_use_core_params():
 	from browser_use.agent.service import _PythonAgent as BrowserUseAgent
 	from browser_use.beta import Agent as BetaAgent
-	from browser_use.tools.service import Tools
 
 	browser_use_hints = get_type_hints(BrowserUseAgent.__init__)
 	beta_hints = get_type_hints(BetaAgent.__init__)
@@ -183,14 +182,16 @@ def test_beta_agent_constructor_type_hints_match_browser_use_core_params():
 	def assert_tools_context_hint(annotation):
 		inner = [arg for arg in get_args(annotation) if arg is not type(None)]
 		assert len(inner) == 1
-		assert get_origin(inner[0]) is Tools
+		origin = get_origin(inner[0])
+		assert origin.__module__ == 'browser_use.tools.service'
+		assert origin.__qualname__ == 'Tools'
 		type_args = get_args(inner[0])
 		assert len(type_args) == 1
 		assert type_args[0].__name__ == 'Context'
+		return origin
 
 	for name in ('tools', 'controller'):
-		assert_tools_context_hint(browser_use_hints[name])
-		assert_tools_context_hint(beta_hints[name])
+		assert_tools_context_hint(browser_use_hints[name]) is assert_tools_context_hint(beta_hints[name])
 
 	assert 'kwargs' not in beta_hints
 	assert 'return' not in beta_hints
@@ -4232,7 +4233,7 @@ def test_beta_agent_mirrors_direct_url_startup():
 	assert "First navigate to 'https://example.com'" in agent.task
 
 
-def test_beta_agent_logs_direct_url_startup_like_browser_use(monkeypatch):
+def test_beta_agent_keeps_legacy_direct_url_startup_log(monkeypatch):
 	from browser_use.agent.service import _PythonAgent as BrowserUseAgent
 	from browser_use.beta import Agent as BetaAgent
 
@@ -4269,9 +4270,8 @@ def test_beta_agent_logs_direct_url_startup_like_browser_use(monkeypatch):
 	BrowserUseAgent(task='Use https://XXX.XX only as an example price placeholder.', llm=LLM())
 	BetaAgent(task='Use https://XXX.XX only as an example price placeholder.', llm=LLM())
 
-	expected = ['🔗 Found URL in task: https://example.com, adding as initial action...']
-	assert browser_use_logger.infos == expected
-	assert beta_logger.infos == expected
+	assert browser_use_logger.infos == ['🔗 Found QA root URL in task: https://example.com; navigation is runner-managed.']
+	assert beta_logger.infos == ['🔗 Found URL in task: https://example.com, adding as initial action...']
 
 
 def test_beta_agent_exposes_task_helper_methods():
@@ -4762,7 +4762,12 @@ def test_beta_agent_initializes_tools_and_action_models():
 	action_names = set(agent.tools.registry.registry.actions)
 	done_schema = agent.DoneActionModel.model_json_schema()
 
-	assert isinstance(agent.tools, Tools)
+	# test_action_timeout reloads browser_use.tools.service to validate its
+	# environment-variable handling.  A Tools instance created before that reload
+	# is behaviorally the same class, but cannot satisfy isinstance() against the
+	# newly-created class object.  Compare the stable runtime type identity instead.
+	assert type(agent.tools).__module__ == Tools.__module__ == 'browser_use.tools.service'
+	assert type(agent.tools).__qualname__ == Tools.__qualname__ == 'Tools'
 	assert 'done' in action_names
 	assert agent.settings.use_vision is True
 	assert 'screenshot' in action_names

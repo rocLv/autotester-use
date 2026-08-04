@@ -618,6 +618,13 @@ class BrowserProfile(BrowserConnectArgs, BrowserLaunchPersistentContextArgs, Bro
 		default=None,
 		description='List of allowed domains for navigation e.g. ["*.google.com", "https://example.com", "chrome-extension://*"]. Lists with 100+ items are auto-optimized to sets (no pattern matching).',
 	)
+	qa_root_url: str | None = Field(
+		default=None,
+		description=(
+			'Optional Web UI QA navigation root. When set, top-level navigation is additionally restricted '
+			'to the same registrable domain (including subdomains).'
+		),
+	)
 	prohibited_domains: list[str] | set[str] | None = Field(
 		default=None,
 		description='List of prohibited domains for navigation e.g. ["*.google.com", "https://example.com", "chrome-extension://*"]. Allowed domains take precedence over prohibited domains. Lists with 100+ items are auto-optimized to sets (no pattern matching).',

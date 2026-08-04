@@ -195,8 +195,8 @@ async def test_initial_state_timeout_still_returns_model_visible_state(browser_s
 	assert state.url
 
 
-async def test_agent_still_calls_model_after_state_timeout(browser_session: BrowserSession, mock_llm, monkeypatch):
-	"""Returning the minimal state must let the normal model/action loop continue."""
+async def test_qa_agent_rejects_missing_url_before_state_timeout(browser_session: BrowserSession, mock_llm, monkeypatch):
+	"""QA specification validation must precede browser-state and execution-model work."""
 
 	class TimedOutStateEvent:
 		async def event_result(self, **_kwargs):
@@ -221,5 +221,7 @@ async def test_agent_still_calls_model_after_state_timeout(browser_session: Brow
 
 	history = await agent.run(max_steps=1)
 
-	assert model_call_count >= 1
+	assert model_call_count == 0
 	assert history.is_done() is True
+	assert history.qa_result is not None
+	assert history.qa_result.status.value == 'INVALID_SPEC'

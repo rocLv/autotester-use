@@ -5,7 +5,9 @@ from browser_use.agent.service import Agent
 from browser_use.browser.events import NavigateToUrlEvent
 from browser_use.browser.profile import BrowserProfile
 from browser_use.browser.session import BrowserSession
-from tests.ci.conftest import create_mock_llm
+from browser_use.qa.compiler import QATaskCompiler
+from browser_use.qa.views import ExpectationSource, WebUITestCase, WebUITestStep
+from tests.ci.qa.test_qa_agent_integration import _qa_llm
 
 
 @pytest.fixture(scope='session')
@@ -81,55 +83,33 @@ async def test_agent_screenshot_with_vision_enabled(browser_session, base_url):
 	"""Test that agent captures screenshots when vision is enabled.
 
 	This integration test verifies that:
-	1. Agent with vision=True navigates to a page
+	1. The QA runner with vision=True navigates to the declared root URL
 	2. After prepare_context/update message manager, screenshot is captured
 	3. Screenshot is included in the agent's history state
 	"""
-
-	# Create mock LLM actions
-	actions = [
-		f"""
-		{{
-			"thinking": "I'll navigate to the screenshot test page",
-			"evaluation_previous_goal": "Starting task",
-			"memory": "Navigating to page",
-			"next_goal": "Navigate to test page",
-			"action": [
-				{{
-					"navigate": {{
-						"url": "{base_url}/screenshot-page",
-						"new_tab": false
-					}}
-				}}
-			]
-		}}
-		""",
-		"""
-		{
-			"thinking": "Page loaded, completing task",
-			"evaluation_previous_goal": "Page loaded",
-			"memory": "Task completed",
-			"next_goal": "Complete task",
-			"action": [
-				{
-					"done": {
-						"text": "Successfully navigated and captured screenshot",
-						"success": true
-					}
-				}
-			]
-		}
-		""",
-	]
-
-	mock_llm = create_mock_llm(actions=actions)
+	root_url = f'{base_url}/screenshot-page'
+	scope = QATaskCompiler.resolve_scope(f'Open {root_url}')
+	test_case = WebUITestCase(
+		root_url=root_url,
+		registrable_domain=scope.registrable_domain,
+		steps=[
+			WebUITestStep(
+				step_id='screenshot-heading',
+				instruction='Inspect the screenshot test page heading',
+				expected_result='The Screenshot Test Page heading is visible',
+				expectation_source=ExpectationSource.UI_CONTRACT,
+				source_evidence=['Visible h1 text: Screenshot Test Page'],
+			)
+		],
+	)
 
 	# Create agent with vision enabled
 	agent = Agent(
-		task=f'Navigate to {base_url}/screenshot-page',
-		llm=mock_llm,
+		task=f'Open {root_url} and verify the Screenshot Test Page heading is visible.',
+		llm=_qa_llm(),
 		browser_session=browser_session,
 		use_vision=True,  # Enable vision/screenshots
+		qa_test_case=test_case,
 	)
 
 	# Run agent

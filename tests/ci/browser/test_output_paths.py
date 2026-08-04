@@ -6,7 +6,10 @@ import pytest
 
 from browser_use import Agent, AgentHistoryList
 from browser_use.browser import BrowserProfile, BrowserSession
+from browser_use.qa.compiler import QATaskCompiler
+from browser_use.qa.views import ExpectationSource, WebUITestCase, WebUITestStep
 from tests.ci.conftest import create_mock_llm
+from tests.ci.qa.test_qa_agent_integration import _qa_llm
 
 
 @pytest.fixture
@@ -44,7 +47,26 @@ async def httpserver_url(httpserver):
 @pytest.fixture
 def llm():
 	"""Create mocked LLM instance for tests."""
-	return create_mock_llm()
+	return _qa_llm()
+
+
+def _recording_test_case(root_url: str) -> WebUITestCase:
+	"""Build a QA-v2 case so recording tests exercise a valid default Agent run."""
+
+	scope = QATaskCompiler.resolve_scope(f'Open {root_url}')
+	return WebUITestCase(
+		root_url=scope.root_url,
+		registrable_domain=scope.registrable_domain,
+		steps=[
+			WebUITestStep(
+				step_id='recording-step',
+				instruction='Inspect the test page heading',
+				expected_result='The test page heading is visible',
+				expectation_source=ExpectationSource.UI_CONTRACT,
+				source_evidence=['Visible h1 text: Test Recording Page'],
+			)
+		],
+	)
 
 
 @pytest.fixture
@@ -155,10 +177,11 @@ class TestAgentRecordings:
 		await browser_session.start()
 		try:
 			agent = Agent(
-				task=f'go to {httpserver_url} and type "test" in the search box',
+				task=f'Open {httpserver_url} and verify the test page heading is visible.',
 				llm=llm,
 				browser_session=browser_session,
 				save_conversation_path=str(conversation_path),
+				qa_test_case=_recording_test_case(httpserver_url),
 			)
 			history: AgentHistoryList = await agent.run(max_steps=2)
 

@@ -1,12 +1,15 @@
 import asyncio
+import base64
 import gc
+import hashlib
 import inspect
 import json
 import logging
 import re
 import tempfile
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, cast
 from urllib.parse import urlparse
@@ -61,13 +64,47 @@ from browser_use.agent.views import (
 	PlanItem,
 	StepMetadata,
 )
-from browser_use.browser.events import _get_timeout
+from browser_use.browser.events import BrowserStartEvent, ScrollEvent, SwitchTabEvent, _get_timeout
 from browser_use.browser.session import DEFAULT_BROWSER_PROFILE
-from browser_use.browser.views import BrowserStateSummary
+from browser_use.browser.views import BrowserError, BrowserStateSummary
 from browser_use.config import CONFIG
 from browser_use.dom.views import DOMInteractedElement, MatchLevel
 from browser_use.filesystem.file_system import FileSystem
 from browser_use.observability import observe, observe_debug
+from browser_use.qa.bundle import QABundle, qa_content_hash
+from browser_use.qa.compiler import QATaskCompiler, WebUITestCaseDraft
+from browser_use.qa.evidence import QAEvidenceCursor, QAEvidenceMonitor
+from browser_use.qa.judge import judge_test_step, replay_assertion_matches
+from browser_use.qa.navigation import NavigationScope
+from browser_use.qa.views import (
+	ActionCompletionStatus,
+	ActionReceipt,
+	BrowserEvidenceSnapshot,
+	EvidenceArtifact,
+	EvidenceKind,
+	EvidenceQuality,
+	ExpectationSource,
+	ExpectationStatus,
+	FailureCode,
+	FailureOrigin,
+	FinishTestStepAction,
+	PreconditionMode,
+	PreconditionStatus,
+	QACleanupResult,
+	QAPhaseTiming,
+	QAPreconditionResult,
+	QARunResult,
+	QARunStatus,
+	QAStepResult,
+	QAStepStatus,
+	ReviewRecord,
+	SideEffectLevel,
+	StepEvidence,
+	StepJudgement,
+	StepOperationKind,
+	WebUITestCase,
+	WebUITestStep,
+)
 from browser_use.telemetry.service import ProductTelemetry
 from browser_use.telemetry.views import AgentTelemetryEvent
 from browser_use.tools.registry.views import ActionModel
@@ -76,8 +113,10 @@ from browser_use.utils import (
 	URL_PATTERN,
 	_log_pretty_path,
 	check_latest_browser_use_version,
+	collect_sensitive_data_values,
 	get_browser_use_version,
 	is_placeholder_url,
+	redact_sensitive_string,
 	sanitize_url_candidate,
 	time_execution_async,
 	time_execution_sync,
@@ -128,6 +167,18 @@ Context = TypeVar('Context')
 
 
 AgentHookFunc = Callable[['Agent'], Awaitable[None]]
+
+
+class QAExplorationStateError(RuntimeError):
+	"""Raised when read-only discovery state cannot be safely restored."""
+
+	def __init__(self, message: str, *, inconclusive: bool = False):
+		super().__init__(message)
+		self.inconclusive = inconclusive
+
+
+class QAIsolatedContextUnavailable(RuntimeError):
+	"""Raised when CDP cannot provide a usable isolated exploration context."""
 
 
 class Agent(Generic[Context, AgentStructuredOutput]):
@@ -184,6 +235,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		use_judge: bool = True,
 		ground_truth: str | None = None,
 		judge_llm: BaseChatModel | None = None,
+		review_llm: BaseChatModel | None = None,
 		injected_agent_state: AgentState | None = None,
 		source: str | None = None,
 		file_system_path: str | None = None,
@@ -207,10 +259,65 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		llm_screenshot_size: tuple[int, int] | None = None,
 		message_compaction: MessageCompactionSettings | bool | None = True,
 		max_clickable_elements_length: int = 40000,
+		max_agent_retries_per_step: int = 3,
+		qa_test_case: WebUITestCase | None = None,
+		reuse_compiled_test_case: bool = True,
+		reuse_login_state: bool = True,
 		_url_shortening_limit: int = 25,
 		enable_signal_handler: bool = True,
 		**kwargs,
 	):
+		if not use_judge:
+			raise ValueError('browser_use.Agent is a Web UI QA agent and requires use_judge=True')
+		if initial_actions:
+			raise ValueError('initial_actions are not supported in QA mode; describe setup as a test step with an expectation')
+		if not 0 <= max_agent_retries_per_step <= 3:
+			raise ValueError('max_agent_retries_per_step must be between 0 and 3')
+
+		self._qa_original_task = task
+		self._qa_scope: NavigationScope | None = None
+		self._qa_scope_error: str | None = None
+		try:
+			self._qa_scope = QATaskCompiler.resolve_scope(task)
+		except ValueError as exc:
+			self._qa_scope_error = str(exc)
+		self._completion_action_name = 'finish_test_step'
+		if qa_test_case is not None and self._qa_scope is not None:
+			if qa_test_case.root_url != self._qa_scope.root_url:
+				raise ValueError('qa_test_case.root_url must match the explicit Task start URL')
+			if qa_test_case.registrable_domain != self._qa_scope.registrable_domain:
+				raise ValueError('qa_test_case.registrable_domain must match the Task navigation scope')
+		self._qa_test_case: WebUITestCase | None = qa_test_case
+		self._qa_compiled_task: str | None = task if qa_test_case is not None else None
+		self._qa_test_case_draft: WebUITestCaseDraft | None = None
+		self._qa_login_storage_state: dict[str, Any] | None = None
+		self._qa_current_step_index = 0
+		self._qa_step_retry_count = 0
+		self._qa_current_attempt_receipts: list[ActionReceipt] = []
+		self._qa_step_results: list[QAStepResult] = []
+		self._qa_step_history_start = 0
+		self._qa_before_snapshot: BrowserEvidenceSnapshot | None = None
+		self._qa_evidence_monitor: QAEvidenceMonitor | None = None
+		self._qa_evidence_cursor: QAEvidenceCursor | None = None
+		self._qa_replay_history: dict[str, list[AgentHistory]] = {}
+		self._qa_phase_timings: dict[str, float] = {}
+		self._qa_phase = 'specification'
+		self._qa_done_callback_called = False
+		self._qa_llm_call_count = 0
+		self._qa_requested_mode: Literal['ai', 'replay'] = 'ai'
+		self._qa_effective_mode: Literal['ai', 'replay', 'ai_fallback'] = 'ai'
+		self._qa_precondition_results = []
+		self._qa_warnings: list[str] = []
+		self._qa_running_preconditions = False
+		self._qa_precondition_step: WebUITestStep | None = None
+		self._qa_run_id = uuid7str()
+		self._qa_cleanup_results: list[QACleanupResult] = []
+		self._qa_running_cleanup = False
+		self._qa_cleanup_index = 0
+		self._qa_pending_business_outcome: dict[str, Any] | None = None
+		self._qa_replay_allow_llm_fallback = True
+		self._qa_replay_fallback_active = False
+		self._qa_replay_fallback_completed = False
 		# Validate llm_screenshot_size
 		if llm_screenshot_size is not None:
 			if not isinstance(llm_screenshot_size, tuple) or len(llm_screenshot_size) != 2:
@@ -253,6 +360,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			page_extraction_llm = llm
 		if judge_llm is None:
 			judge_llm = llm
+		if review_llm is None:
+			review_llm = judge_llm
 		if available_file_paths is None:
 			available_file_paths = []
 
@@ -282,6 +391,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		base_profile = browser_profile or DEFAULT_BROWSER_PROFILE
 		if base_profile is DEFAULT_BROWSER_PROFILE:
 			base_profile = base_profile.model_copy()
+		if self._qa_scope is not None:
+			base_profile = base_profile.model_copy(update={'qa_root_url': self._qa_scope.root_url})
 		if demo_mode is not None and base_profile.demo_mode != demo_mode:
 			base_profile = base_profile.model_copy(update={'demo_mode': demo_mode})
 		browser_profile = base_profile
@@ -298,6 +409,18 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			browser_profile=browser_profile,
 			id=uuid7str()[:-4] + self.id[-4:],  # re-use the same 4-char suffix so they show up together in logs
 		)
+		if self._qa_scope is not None and self.browser_session.browser_profile.qa_root_url != self._qa_scope.root_url:
+			self.browser_session.browser_profile = self.browser_session.browser_profile.model_copy(
+				update={'qa_root_url': self._qa_scope.root_url}
+			)
+		if self._qa_scope is not None:
+			from browser_use.browser.watchdogs.security_watchdog import SecurityWatchdog
+
+			policy = SecurityWatchdog(event_bus=self.browser_session.event_bus, browser_session=self.browser_session)
+			if not policy._is_url_allowed(self._qa_scope.root_url):
+				self._qa_scope_error = (
+					'QA root URL conflicts with the caller allowed_domains, prohibited_domains, or IP-address policy'
+				)
 
 		self._demo_mode_enabled: bool = bool(self.browser_profile.demo_mode) if self.browser_session else False
 		if self._demo_mode_enabled and getattr(self.browser_profile, 'headless', False):
@@ -358,9 +481,34 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		elif output_model_schema is None and tools_output_model is not None:
 			# Only tools has it - use that (cast is safe: both are BaseModel subclasses)
 			output_model_schema = cast(type[AgentStructuredOutput], tools_output_model)
-		self.output_model_schema = output_model_schema
-		if self.output_model_schema is not None:
-			self.tools.use_structured_output_action(self.output_model_schema)
+		if output_model_schema is not None:
+			logger.warning('output_model_schema is ignored by the QA Agent; read the fixed history.qa_result schema')
+		output_model_schema = None
+		self.output_model_schema = None
+
+		# QA owns the terminal result schema. The executor can only signal that the
+		# current business step is ready for an independent judgement.
+		# Valid QA specifications cannot self-complete through done(success=...). Keep
+		# the legacy schema only for INVALID_SPEC objects, whose run() exits before
+		# any executor/browser call; this preserves harmless inspection helpers.
+		if self._qa_scope is not None:
+			self.tools.exclude_action('done')
+
+		@self.tools.action(
+			'Finish the current business test step and submit objective observations for independent judgement. '
+			'Do not decide pass or fail yourself. This action must be called alone.',
+			param_model=FinishTestStepAction,
+			terminates_sequence=True,
+		)
+		async def finish_test_step(params: FinishTestStepAction):
+			report = params.model_dump(mode='json')
+			return ActionResult(
+				is_done=True,
+				success=None,
+				extracted_content=params.actual_result,
+				long_term_memory=f'Business step submitted for independent QA judgement: {params.actual_result}',
+				metadata={'qa_finish_test_step': report},
+			)
 
 		# Per-page extract uses a schema only when the caller explicitly asks for one.
 		# It must NOT inherit output_model_schema: that describes the final task result
@@ -373,6 +521,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.task = self._enhance_task_with_schema(task, output_model_schema)
 		self.llm = llm
 		self.judge_llm = judge_llm
+		self.review_llm = review_llm
 
 		# Fallback LLM configuration
 		self._fallback_llm: BaseChatModel | None = fallback_llm
@@ -394,7 +543,10 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			vision_detail_level=vision_detail_level,
 			save_conversation_path=save_conversation_path,
 			save_conversation_path_encoding=save_conversation_path_encoding,
-			max_failures=max_failures,
+			# A low-level tool/model failure immediately forces a step-boundary report.
+			# Only the independent judge may authorize up to
+			# max_agent_retries_per_step safe business-step replays.
+			max_failures=1,
 			override_system_message=override_system_message,
 			extend_system_message=extend_system_message,
 			generate_gif=generate_gif,
@@ -418,6 +570,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			loop_detection_enabled=loop_detection_enabled,
 			message_compaction=message_compaction,
 			max_clickable_elements_length=max_clickable_elements_length,
+			max_agent_retries_per_step=max_agent_retries_per_step,
+			reuse_compiled_test_case=reuse_compiled_test_case,
+			reuse_login_state=reuse_login_state,
 		)
 
 		# Token cost service
@@ -425,6 +580,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.token_cost_service.register_llm(llm)
 		self.token_cost_service.register_llm(page_extraction_llm)
 		self.token_cost_service.register_llm(judge_llm)
+		self.token_cost_service.register_llm(review_llm)
 		if self.settings.message_compaction and self.settings.message_compaction.compaction_llm:
 			self.token_cost_service.register_llm(self.settings.message_compaction.compaction_llm)
 
@@ -457,12 +613,15 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		initial_url = None
 
-		# only load url if no initial actions are provided
+		# The QA runner owns root navigation. Keeping it out of initial_actions avoids
+		# racing compilation/exploration and guarantees one formal root navigation.
 		if self.directly_open_url and not self.state.follow_up_task and not initial_actions:
-			initial_url = self._extract_start_url(self.task)
+			# Preserve constructor-level URL discovery metadata for compatibility,
+			# while run() still returns INVALID_SPEC before browser startup unless an
+			# explicit HTTP(S) URL produced a valid QA scope.
+			initial_url = self._qa_scope.root_url if self._qa_scope is not None else self._extract_start_url(task)
 			if initial_url:
-				self.logger.info(f'🔗 Found URL in task: {initial_url}, adding as initial action...')
-				initial_actions = [{'navigate': {'url': initial_url, 'new_tab': False}}]
+				self.logger.info(f'🔗 Found QA root URL in task: {initial_url}; navigation is runner-managed.')
 
 		self.initial_url = initial_url
 
@@ -502,12 +661,29 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		# Initialize message manager with state
 		# Initial system prompt with all actions - will be updated during each step
+		qa_system_extension = """
+<web_ui_qa_mode>
+This agent executes Web UI QA business steps. The latest QA STEP message is the only current objective.
+Do not optimize for completing an overall task and do not decide whether the SUT passed or failed.
+Perform only the actions needed for the current business step. Verify the resulting page using objective browser evidence.
+When enough evidence exists, call finish_test_step as a single action. Report what is actually visible, not a success opinion.
+Never navigate outside the configured QA root domain. Do not use search engines or external research.
+For submit, delete, payment, or other irreversible actions, do not repeat the action when its side effect is uncertain; set side_effect_uncertain instead.
+</web_ui_qa_mode>
+"""
+		resolved_system_extension = qa_system_extension
+		if extend_system_message:
+			resolved_system_extension = f'{extend_system_message}\n{qa_system_extension}'
+
 		self._message_manager = MessageManager(
-			task=self.task,
+			# The compiler receives the full natural-language specification. The
+			# executor receives only the current business step later in
+			# _prepare_qa_case(), preventing it from racing ahead or self-judging the case.
+			task='Wait for the QA runner to provide the current compiled business step.',
 			system_message=SystemPrompt(
 				max_actions_per_step=self.settings.max_actions_per_step,
 				override_system_message=override_system_message,
-				extend_system_message=extend_system_message,
+				extend_system_message=resolved_system_extension,
 				use_thinking=self.settings.use_thinking,
 				flash_mode=self.settings.flash_mode,
 				is_anthropic=is_anthropic,
@@ -783,8 +959,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		else:
 			self.AgentOutput = AgentOutput.type_with_custom_actions_no_thinking(self.ActionModel)
 
-		# used to force the done action when max_steps is reached
-		self.DoneActionModel = self.tools.registry.create_action_model(include_actions=['done'])
+		# Used to force a QA step boundary when the low-level step budget is reached.
+		self.DoneActionModel = self.tools.registry.create_action_model(include_actions=[self._completion_action_name])
 		if self.settings.flash_mode:
 			self.DoneAgentOutput = AgentOutput.type_with_custom_actions_flash_mode(self.DoneActionModel)
 		elif self.settings.use_thinking:
@@ -990,19 +1166,754 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 	def add_new_task(self, new_task: str) -> None:
 		"""Add a new task to the agent, keeping the same task_id as tasks are continuous"""
+		previous_run_completed = self.history.qa_result is not None
+		reuse_cached_case = bool(
+			self.settings.reuse_compiled_test_case
+			and self._qa_test_case is not None
+			and self._qa_compiled_task is not None
+			and new_task.strip() == self._qa_compiled_task.strip()
+		)
+		try:
+			new_scope = QATaskCompiler.resolve_scope(new_task)
+		except ValueError as exc:
+			self._qa_scope_error = str(exc)
+			new_scope = None
+		if self._qa_scope is not None and new_scope is not None:
+			if new_scope.registrable_domain != self._qa_scope.registrable_domain:
+				raise ValueError('A follow-up QA task cannot change registrable domain; create a new Agent instead')
+		self._qa_original_task = new_task
+		if new_scope is not None:
+			self._qa_scope = new_scope
+			self._qa_scope_error = None
+			self.browser_session.browser_profile = self.browser_session.browser_profile.model_copy(
+				update={'qa_root_url': new_scope.root_url}
+			)
+			from browser_use.browser.watchdogs.security_watchdog import SecurityWatchdog
+
+			policy = SecurityWatchdog(event_bus=self.browser_session.event_bus, browser_session=self.browser_session)
+			if not policy._is_url_allowed(new_scope.root_url):
+				self._qa_scope_error = (
+					'QA root URL conflicts with the caller allowed_domains, prohibited_domains, or IP-address policy'
+				)
+		if not reuse_cached_case:
+			self._qa_test_case = None
+			self._qa_compiled_task = None
+			self._qa_replay_history = {}
+		self._qa_test_case_draft = None
+		self._qa_step_results = []
+		self._qa_current_step_index = 0
+		self._qa_step_retry_count = 0
+		self._qa_current_attempt_receipts = []
+		self._qa_evidence_cursor = None
+		self._qa_phase_timings = {}
+		self._qa_done_callback_called = False
+		self._qa_llm_call_count = 0
+		self._qa_requested_mode = 'ai'
+		self._qa_effective_mode = 'ai'
+		self._qa_precondition_results = []
+		self._qa_warnings = []
+		self._qa_running_preconditions = False
+		self._qa_precondition_step = None
+		self._qa_run_id = uuid7str()
+		self._qa_cleanup_results = []
+		self._qa_running_cleanup = False
+		self._qa_cleanup_index = 0
+		self._qa_pending_business_outcome = None
+		self._qa_replay_allow_llm_fallback = True
+		self._qa_replay_fallback_active = False
+		self._qa_replay_fallback_completed = False
+		self.history.qa_result = None
 		# Simply delegate to message manager - no need for new task_id or events
 		# The task continues with new instructions, it doesn't end and start a new one
 		self.task = new_task
-		self._message_manager.add_new_task(new_task)
+		message = (
+			'Reusing the validated QA specification. Wait for the current QA STEP.'
+			if reuse_cached_case
+			else 'A new QA specification is being compiled. Wait for the current QA STEP.'
+		)
+		if previous_run_completed:
+			self._reset_qa_execution_message_context()
+		self._message_manager.add_new_task(message)
 		# Mark as follow-up task and recreate eventbus (gets shut down after each run)
 		self.state.follow_up_task = True
 		# Reset control flags so agent can continue
 		self.state.stopped = False
 		self.state.paused = False
-		agent_id_suffix = str(self.id)[-4:].replace('-', '_')
-		if agent_id_suffix and agent_id_suffix[0].isdigit():
-			agent_id_suffix = 'a' + agent_id_suffix
-		self.eventbus = EventBus(name=f'Agent_{agent_id_suffix}')
+		self.state.n_steps = 1
+		self.state.consecutive_failures = 0
+		self.state.last_result = None
+		self.state.last_model_output = None
+		if self.state.session_initialized or previous_run_completed:
+			agent_id_suffix = str(self.id)[-4:].replace('-', '_')
+			if agent_id_suffix and agent_id_suffix[0].isdigit():
+				agent_id_suffix = 'a' + agent_id_suffix
+			self.eventbus = EventBus(name=f'Agent_{agent_id_suffix}')
+
+	def _reset_qa_execution_message_context(self) -> None:
+		"""Exclude a completed run's executor transcript from the next independent QA run."""
+
+		current_system_message = self._message_manager.state.history.system_message or self._message_manager.system_prompt
+		fresh_state = type(self.state.message_manager_state)()
+		fresh_state.history.system_message = current_system_message
+		self.state.message_manager_state = fresh_state
+		self._message_manager.state = fresh_state
+		self._message_manager.task = 'Wait for the QA runner to provide the current compiled business step.'
+		self._message_manager.last_input_messages = []
+		self._message_manager.last_state_message_text = None
+		self._message_manager.sensitive_data_description = ''
+
+	def _record_qa_phase_timing(self, phase: str, elapsed_seconds: float) -> None:
+		"""Accumulate a named wall-clock measurement and update an attached result."""
+
+		self._qa_phase_timings[phase] = self._qa_phase_timings.get(phase, 0.0) + max(elapsed_seconds, 0.0)
+		self._sync_qa_phase_timings()
+
+	def _sync_qa_phase_timings(self) -> None:
+		"""Expose current runner timings through the strongly typed QA result."""
+
+		if self.history.qa_result is None:
+			return
+		self.history.qa_result.phase_timings = [
+			QAPhaseTiming(phase=phase, elapsed_seconds=elapsed) for phase, elapsed in self._qa_phase_timings.items()
+		]
+
+	def save_qa_bundle(self, path: str | Path) -> QABundle:
+		"""Persist the compiled case, redacted evidence, and replay traces as a v2 bundle."""
+
+		if self.history.qa_result is None:
+			raise ValueError('Cannot save a QA bundle before the Agent has produced qa_result')
+		action_history = {
+			step_id: [item.model_dump(sensitive_data=self.sensitive_data) for item in history]
+			for step_id, history in self._qa_replay_history.items()
+		}
+		redacted_result = self._redacted_qa_result_for_persistence(self.history.qa_result)
+		return QABundle.save(
+			path,
+			task=self._qa_original_task,
+			ground_truth=self.settings.ground_truth,
+			run_result=redacted_result,
+			action_history=action_history,
+		)
+
+	def _redacted_qa_result_for_persistence(self, result: QARunResult) -> QARunResult:
+		"""Apply a final defense-in-depth redaction before reports or bundles are written."""
+
+		serialized = result.model_dump_json()
+		sensitive_values = collect_sensitive_data_values(self.sensitive_data)
+		if sensitive_values:
+			serialized = redact_sensitive_string(serialized, sensitive_values)
+		return QARunResult.model_validate_json(serialized)
+
+	def save_qa_report(
+		self,
+		path: str | Path,
+		*,
+		format: Literal['json', 'junit', 'html'] | None = None,
+	) -> Path:
+		"""Write the current QA result as JSON, JUnit XML, or self-contained HTML."""
+
+		if self.history.qa_result is None:
+			raise ValueError('Cannot save a QA report before the Agent has produced qa_result')
+		from browser_use.qa.reporting import write_qa_html_report, write_qa_json_report, write_qa_junit_report
+
+		report_path = Path(path)
+		selected_format = format
+		if selected_format is None:
+			selected_format = {'.json': 'json', '.xml': 'junit', '.html': 'html', '.htm': 'html'}.get(
+				report_path.suffix.casefold()
+			)
+		if selected_format is None:
+			raise ValueError('Report format must be json, junit, or html (or use a recognized file extension)')
+		writer = {
+			'json': write_qa_json_report,
+			'junit': write_qa_junit_report,
+			'html': write_qa_html_report,
+		}[selected_format]
+		return writer(self._redacted_qa_result_for_persistence(self.history.qa_result), report_path)
+
+	def _load_qa_bundle_for_replay(self, bundle: QABundle | str | Path) -> QARunResult:
+		"""Validate a bundle against this Agent and restore its cross-process trace."""
+
+		loaded = bundle if isinstance(bundle, QABundle) else QABundle.load(bundle)
+		if loaded.manifest.task_hash != qa_content_hash(self._qa_original_task):
+			raise ValueError('QA bundle Task does not match this Agent Task')
+		if loaded.manifest.ground_truth_hash != qa_content_hash(self.settings.ground_truth):
+			raise ValueError('QA bundle ground_truth does not match this Agent')
+		if self._qa_scope is None:
+			raise ValueError('QA bundle replay requires a valid Task navigation scope')
+		if loaded.manifest.root_url != self._qa_scope.root_url:
+			raise ValueError('QA bundle root URL does not match this Agent Task')
+		if loaded.manifest.registrable_domain != self._qa_scope.registrable_domain:
+			raise ValueError('QA bundle registrable domain does not match this Agent Task')
+		if loaded.run_result.legacy_imported:
+			raise ValueError('Legacy imported QA results cannot be used as a v2 replay baseline')
+		if loaded.run_result.status != QARunStatus.PASSED or not loaded.run_result.has_reliable_verdict:
+			raise ValueError('QA bundle replay requires a reliable PASSED baseline')
+
+		self._qa_test_case = loaded.test_case.model_copy(deep=True)
+		self._qa_compiled_task = self._qa_original_task
+		self._qa_replay_history = {}
+		for step_id, serialized_items in loaded.action_history.items():
+			loaded_history = AgentHistoryList.load_from_dict({'history': serialized_items}, self.AgentOutput)
+			self._qa_replay_history[step_id] = [item.model_copy(deep=True) for item in loaded_history.history]
+		return loaded.run_result.model_copy(deep=True)
+
+	@contextmanager
+	def _measure_qa_phase(self, phase: str) -> Iterator[None]:
+		"""Measure one synchronous or asynchronous QA runner block."""
+
+		started_at = time.perf_counter()
+		try:
+			yield
+		finally:
+			self._record_qa_phase_timing(phase, time.perf_counter() - started_at)
+
+	async def rerun(
+		self,
+		max_steps: int = 500,
+		on_step_start: AgentHookFunc | None = None,
+		on_step_end: AgentHookFunc | None = None,
+		mode: Literal['ai', 'replay'] = 'ai',
+		bundle: QABundle | str | Path | None = None,
+		allow_llm_fallback: bool = True,
+	) -> AgentHistoryList[AgentStructuredOutput]:
+		"""Repeat a QA Task using AI or audited replay with optional AI drift repair."""
+
+		if mode not in {'ai', 'replay'}:
+			raise ValueError("rerun mode must be 'ai' or 'replay'")
+		baseline_result = self.history.qa_result.model_copy(deep=True) if self.history.qa_result is not None else None
+		if bundle is not None:
+			if mode != 'replay':
+				raise ValueError('bundle is only supported with mode="replay"')
+			baseline_result = self._load_qa_bundle_for_replay(bundle)
+		self.add_new_task(self._qa_original_task)
+		if mode == 'replay':
+			self._qa_requested_mode = 'replay'
+			self._qa_effective_mode = 'replay'
+			self._qa_replay_allow_llm_fallback = allow_llm_fallback
+			return await self._run_qa_replay(
+				baseline_result,
+				max_steps=max_steps,
+				on_step_start=on_step_start,
+				on_step_end=on_step_end,
+			)
+		self._qa_requested_mode = 'ai'
+		self._qa_effective_mode = 'ai'
+		return await self.run(max_steps=max_steps, on_step_start=on_step_start, on_step_end=on_step_end)
+
+	def _ensure_browser_session_can_restart(self) -> None:
+		"""Restore BrowserSession lifecycle handlers cleared by the previous closed run."""
+
+		start_handlers = self.browser_session.event_bus.handlers.get(BrowserStartEvent.__name__, [])
+		if not start_handlers:
+			self.browser_session.model_post_init(None)
+
+	@staticmethod
+	def _qa_replay_action_name(action: ActionModel) -> str:
+		action_data = action.model_dump(exclude_unset=True)
+		return next(iter(action_data), '')
+
+	def _prepare_qa_replay_history_item(self, history_item: AgentHistory) -> tuple[AgentHistory | None, list[str], str | None]:
+		"""Prepare one saved action batch for fast, model-free execution."""
+
+		if history_item.model_output is None:
+			return None, [], None
+		kept_actions: list[ActionModel] = []
+		kept_elements: list[DOMInteractedElement | None] = []
+		action_names: list[str] = []
+		interacted_elements = history_item.state.interacted_element or []
+		for index, action in enumerate(history_item.model_output.action):
+			action_name = self._qa_replay_action_name(action)
+			if action_name == self._completion_action_name:
+				continue
+			if action_name == 'extract':
+				return None, [], 'extract actions require an LLM and cannot be used in strict replay mode'
+			replay_action = action.model_copy(deep=True)
+			if action_name == 'wait':
+				# Subsequent target-aware waits replace the executor's conservative fixed delay.
+				# Keep the action for trace compatibility, but make Browser Use's wait action a no-op
+				# (it subtracts one second before sleeping).
+				action_data = replay_action.model_dump(exclude_unset=True)
+				wait_params = action_data.get(action_name)
+				if isinstance(wait_params, dict) and isinstance(wait_params.get('seconds'), int):
+					wait_params['seconds'] = min(wait_params['seconds'], 1)
+					replay_action = type(action).model_validate(action_data)
+			kept_actions.append(replay_action)
+			action_names.append(action_name)
+			kept_elements.append(interacted_elements[index] if index < len(interacted_elements) else None)
+		if not kept_actions:
+			return None, [], None
+
+		replay_item = history_item.model_copy(deep=True)
+		assert replay_item.model_output is not None
+		replay_item.model_output.action = [action.model_copy(deep=True) for action in kept_actions]
+		replay_item.state.interacted_element = kept_elements
+		return replay_item, action_names, None
+
+	@staticmethod
+	def _qa_replay_is_interaction(action_name: str) -> bool:
+		return action_name not in {'wait', 'screenshot', 'scroll', 'read_state'}
+
+	def _append_qa_replay_terminal_history(self, snapshot: BrowserEvidenceSnapshot, message: str) -> None:
+		"""Expose the replay's final browser state through the existing history interface."""
+
+		self.history.add_item(
+			AgentHistory(
+				model_output=None,
+				result=[ActionResult(is_done=False, extracted_content=message, long_term_memory=message)],
+				state=BrowserStateHistory(
+					url=snapshot.url,
+					title=snapshot.title,
+					tabs=[],
+					interacted_element=[],
+					screenshot_path=snapshot.screenshot_path,
+				),
+				metadata=None,
+			)
+		)
+
+	def _judge_qa_replay_step(
+		self,
+		*,
+		step: WebUITestStep,
+		baseline: QAStepResult,
+		evidence: StepEvidence,
+		last_interaction_completed: bool,
+		had_interactions: bool,
+	) -> StepJudgement:
+		"""Apply the first reliable run's typed assertions without invoking a model."""
+
+		assertions = baseline.judgement.replay_assertions if baseline.judgement is not None else []
+		evidence_ids = evidence.after.evidence_ids
+		if not assertions:
+			return StepJudgement(
+				action_status=ActionCompletionStatus.UNCERTAIN,
+				expectation_status=ExpectationStatus.NOT_OBSERVABLE,
+				status=QAStepStatus.INCONCLUSIVE,
+				failure_origin=FailureOrigin.UNKNOWN,
+				reasoning='The reliable first run produced no deterministic replay assertions.',
+				actual_result='The step cannot be revalidated without an LLM.',
+			)
+
+		assertion_results = [(assertion, replay_assertion_matches(assertion, evidence.after)) for assertion in assertions]
+		failed = [assertion for assertion, matched in assertion_results if not matched]
+		assertion_evidence = [
+			f'{assertion.kind.value}({assertion.value!r})={"MET" if matched else "NOT_MET"}'
+			for assertion, matched in assertion_results
+		]
+		if not failed and (last_interaction_completed or not had_interactions):
+			return StepJudgement(
+				action_status=ActionCompletionStatus.COMPLETED,
+				expectation_status=ExpectationStatus.MET,
+				status=QAStepStatus.PASSED,
+				failure_origin=FailureOrigin.NONE,
+				reasoning='The saved action completed and every deterministic assertion from the reliable first run is met.',
+				actual_result='All deterministic replay assertions are met.',
+				evidence=assertion_evidence,
+				evidence_ids=evidence_ids,
+				confidence=1.0,
+				replay_assertions=assertions,
+			)
+		if not failed:
+			return StepJudgement(
+				action_status=ActionCompletionStatus.NOT_COMPLETED,
+				expectation_status=ExpectationStatus.MET,
+				status=QAStepStatus.AGENT_FAILED,
+				failure_origin=FailureOrigin.AGENT,
+				reasoning='The expected state is present, but the saved final interaction could not be confirmed.',
+				actual_result='Deterministic replay did not confirm the intended business action.',
+				evidence=assertion_evidence,
+			)
+
+		if any(assertion.kind.value.startswith('dom_') and not evidence.after.dom_summary.strip() for assertion in failed):
+			return StepJudgement(
+				action_status=(
+					ActionCompletionStatus.COMPLETED if last_interaction_completed else ActionCompletionStatus.UNCERTAIN
+				),
+				expectation_status=ExpectationStatus.NOT_OBSERVABLE,
+				status=QAStepStatus.INCONCLUSIVE,
+				failure_origin=FailureOrigin.UNKNOWN,
+				reasoning='DOM evidence is empty, so failed DOM assertions are not a reliable product verdict.',
+				actual_result='Expected DOM evidence could not be observed.',
+				evidence=assertion_evidence,
+			)
+		if not last_interaction_completed and had_interactions:
+			return StepJudgement(
+				action_status=ActionCompletionStatus.NOT_COMPLETED,
+				expectation_status=ExpectationStatus.NOT_OBSERVABLE,
+				status=QAStepStatus.AGENT_FAILED,
+				failure_origin=FailureOrigin.AGENT,
+				reasoning='The saved final business interaction could not be replayed.',
+				actual_result='Deterministic action replay failed before the expected state was established.',
+				evidence=assertion_evidence,
+			)
+		if step.expectation_source == ExpectationSource.HEURISTIC:
+			return StepJudgement(
+				action_status=ActionCompletionStatus.COMPLETED,
+				expectation_status=ExpectationStatus.NOT_OBSERVABLE,
+				status=QAStepStatus.INCONCLUSIVE,
+				failure_origin=FailureOrigin.UNKNOWN,
+				reasoning='A heuristic expectation cannot establish a SUT defect in model-free replay.',
+				actual_result='One or more heuristic replay assertions are not met.',
+				evidence=assertion_evidence,
+			)
+		return StepJudgement(
+			action_status=ActionCompletionStatus.COMPLETED,
+			expectation_status=ExpectationStatus.NOT_MET,
+			status=QAStepStatus.SUT_FAILED,
+			failure_origin=FailureOrigin.SUT,
+			reasoning='The saved business action completed, but reliable deterministic assertions are not met.',
+			actual_result='One or more deterministic expected-result assertions are not met.',
+			evidence=assertion_evidence,
+			evidence_ids=evidence_ids,
+			confidence=1.0,
+			failure_code=FailureCode.SUT_EXPECTATION_MISMATCH,
+		)
+
+	async def _run_ai_fallback_for_replay_step(
+		self,
+		*,
+		step_index: int,
+		fallback_reason: str,
+		max_steps: int,
+		on_step_start: AgentHookFunc | None,
+		on_step_end: AgentHookFunc | None,
+	) -> bool:
+		"""Let AI repair only the drifted replay step, then return control to replay."""
+
+		assert self._qa_test_case is not None
+		step = self._qa_test_case.steps[step_index]
+		self._qa_effective_mode = 'ai_fallback'
+		self._qa_warnings.append(f'AI fallback for {step.step_id}: {fallback_reason}')
+		self.logger.warning(f'↪️ Replay drift at {step.step_id}; invoking AI only for this step: {fallback_reason}')
+		if self._qa_step_results and self._qa_step_results[-1].step.step_id == step.step_id:
+			self._qa_step_results.pop()
+		self._qa_current_step_index = step_index
+		self._qa_step_retry_count = 0
+		self._qa_before_snapshot = await self._capture_qa_snapshot(f'{step.step_id}_ai_fallback_before', include_screenshot=True)
+		self._qa_evidence_cursor = self._qa_evidence_monitor.cursor() if self._qa_evidence_monitor else None
+		self._qa_step_history_start = len(self.history.history)
+		self._qa_phase = 'ai_fallback'
+		self._qa_replay_fallback_active = True
+		self._qa_replay_fallback_completed = False
+		self._reset_qa_execution_message_context()
+		self._message_manager.add_new_task(self._qa_step_prompt(step))
+		for fallback_step_number in range(max_steps):
+			step_info = AgentStepInfo(step_number=fallback_step_number, max_steps=max_steps)
+			is_done = await self._execute_step(
+				fallback_step_number,
+				max_steps,
+				step_info,
+				on_step_start,
+				on_step_end,
+			)
+			if not is_done:
+				continue
+			terminal = await self._handle_qa_step_boundary()
+			if self._qa_replay_fallback_completed:
+				self._qa_phase = 'replay'
+				return True
+			if terminal:
+				return False
+		self._qa_replay_fallback_active = False
+		self._finalize_qa_result(
+			status=QARunStatus.AGENT_FAILED,
+			failure_origin=FailureOrigin.AGENT,
+			failure_code=FailureCode.AGENT_STEP_BUDGET,
+			stopped_at_step=step.step_id,
+			summary=f'AGENT_FAILED at {step.step_id}: AI fallback exhausted its step budget.',
+		)
+		return False
+
+	async def _run_qa_replay(
+		self,
+		baseline_result: QARunResult | None,
+		*,
+		max_steps: int,
+		on_step_start: AgentHookFunc | None,
+		on_step_end: AgentHookFunc | None,
+	) -> AgentHistoryList[AgentStructuredOutput]:
+		"""Execute and judge a previously passed QA case without any LLM calls."""
+
+		replay_started_at = time.perf_counter()
+		self._session_start_time = time.time()
+		self._task_start_time = self._session_start_time
+		self._qa_phase = 'replay'
+		self._qa_step_results = []
+		self._qa_phase_timings = {}
+		last_snapshot = BrowserEvidenceSnapshot(url=self._qa_scope.root_url if self._qa_scope else '')
+		try:
+			if (
+				baseline_result is None
+				or baseline_result.legacy_imported
+				or baseline_result.status != QARunStatus.PASSED
+				or not baseline_result.has_reliable_verdict
+				or baseline_result.test_case is None
+			):
+				self._append_qa_replay_terminal_history(last_snapshot, 'No reliable PASSED baseline is available for replay.')
+				self._finalize_qa_result(
+					status=QARunStatus.INCONCLUSIVE,
+					failure_origin=FailureOrigin.UNKNOWN,
+					summary='INCONCLUSIVE: deterministic replay requires a reliable PASSED first run.',
+				)
+				return self.history
+			if self._qa_scope is None or self._qa_test_case is None:
+				self._append_qa_replay_terminal_history(last_snapshot, 'The cached QA specification is unavailable.')
+				self._finalize_qa_result(
+					status=QARunStatus.INCONCLUSIVE,
+					failure_origin=FailureOrigin.UNKNOWN,
+					summary='INCONCLUSIVE: deterministic replay requires a cached QA specification.',
+				)
+				return self.history
+
+			baseline_steps = {result.step.step_id: result for result in baseline_result.step_results}
+			self.logger.info('⚙️ Starting deterministic QA replay with zero LLM calls.')
+			self._ensure_browser_session_can_restart()
+			with self._measure_qa_phase('browser_start'):
+				await self.browser_session.start()
+			with self._measure_qa_phase('login_state_restore'):
+				await self._restore_cached_qa_login_state()
+			self._qa_evidence_monitor = QAEvidenceMonitor(self.browser_session, self._qa_scope)
+			with self._measure_qa_phase('evidence_monitor_start'):
+				await self._qa_evidence_monitor.start()
+			with self._measure_qa_phase('root_navigation'):
+				await self.browser_session.navigate_to(self._qa_scope.root_url, new_tab=False)
+				await self._wait_for_qa_page_stability()
+
+			for step_index, step in enumerate(self._qa_test_case.steps):
+				baseline_step = baseline_steps.get(step.step_id)
+				replay_history = self._qa_replay_history.get(step.step_id, [])
+				if baseline_step is None or not replay_history:
+					last_snapshot = await self._capture_qa_snapshot(
+						f'{step.step_id}_replay_unavailable', include_screenshot=False
+					)
+					judgement = StepJudgement(
+						action_status=ActionCompletionStatus.UNCERTAIN,
+						expectation_status=ExpectationStatus.NOT_OBSERVABLE,
+						status=QAStepStatus.INCONCLUSIVE,
+						failure_origin=FailureOrigin.UNKNOWN,
+						reasoning='No reliable in-memory action trace is available for this step.',
+						actual_result='The step cannot be replayed without an LLM.',
+					)
+					evidence = StepEvidence(before=last_snapshot, after=last_snapshot)
+					self._qa_step_results.append(
+						QAStepResult(step=step, status=judgement.status, judgement=judgement, evidence=evidence)
+					)
+					if self._qa_replay_allow_llm_fallback:
+						fallback_passed = await self._run_ai_fallback_for_replay_step(
+							step_index=step_index,
+							fallback_reason=judgement.reasoning,
+							max_steps=max_steps,
+							on_step_start=on_step_start,
+							on_step_end=on_step_end,
+						)
+						if fallback_passed:
+							continue
+						break
+					self._append_qa_replay_terminal_history(last_snapshot, judgement.actual_result)
+					self._finalize_qa_result(
+						status=QARunStatus.INCONCLUSIVE,
+						failure_origin=FailureOrigin.UNKNOWN,
+						stopped_at_step=step.step_id,
+						summary=f'INCONCLUSIVE at {step.step_id}: {judgement.actual_result}',
+					)
+					break
+
+				self._qa_evidence_cursor = self._qa_evidence_monitor.cursor()
+				with self._measure_qa_phase(f'{step.step_id}.before_evidence'):
+					before = await self._capture_qa_lightweight_snapshot()
+				prepared_items: list[tuple[AgentHistory, list[str]]] = []
+				unsupported_reason: str | None = None
+				for history_item in replay_history:
+					prepared_item, action_names, error = self._prepare_qa_replay_history_item(history_item)
+					if error:
+						unsupported_reason = error
+						break
+					if prepared_item is not None:
+						prepared_items.append((prepared_item, action_names))
+
+				had_interactions = any(
+					self._qa_replay_is_interaction(action_name)
+					for _, action_names in prepared_items
+					for action_name in action_names
+				)
+				interaction_total = sum(
+					self._qa_replay_is_interaction(action_name)
+					for _, action_names in prepared_items
+					for action_name in action_names
+				)
+				interaction_index = 0
+				last_interaction_completed = False
+				action_results: list[dict[str, Any]] = []
+				if unsupported_reason:
+					action_results.append({'error': unsupported_reason})
+				else:
+					for prepared_item, action_names in prepared_items:
+						try:
+							await asyncio.sleep(min(self.browser_profile.wait_between_actions, 0.5))
+							with self._measure_qa_phase(f'{step.step_id}.target_wait'):
+								initial_replay_state = await self.browser_session.get_browser_state_summary(
+									include_screenshot=False
+								)
+								if self._qa_replay_authentication_batch_is_obsolete(prepared_item, initial_replay_state):
+									interaction_index += sum(
+										self._qa_replay_is_interaction(action_name) for action_name in action_names
+									)
+									action_results.append(
+										{
+											'warning': 'Skipped saved authentication actions because reused login state is already authenticated.',
+											'skipped_actions': action_names,
+										}
+									)
+									continue
+								replay_state = await self._wait_for_history_targets(
+									prepared_item,
+									timeout=15.0,
+									poll_interval=0.5,
+									initial_state=initial_replay_state,
+								)
+							with self._measure_qa_phase(f'{step.step_id}.action_execution'):
+								results = await self._execute_history_step(
+									prepared_item,
+									delay=0,
+									ai_step_llm=None,
+									wait_for_elements=False,
+									browser_state_summary=replay_state,
+								)
+							action_results.extend(
+								result.model_dump(exclude_none=True, mode='json', exclude={'images'}) for result in results
+							)
+							for result_index, action_name in enumerate(action_names):
+								if not self._qa_replay_is_interaction(action_name):
+									continue
+								interaction_index += 1
+								if interaction_index == interaction_total:
+									last_interaction_completed = (
+										result_index < len(results) and results[result_index].error is None
+									)
+						except Exception as exc:
+							action_results.append({'error': f'{type(exc).__name__}: {exc}'})
+							interaction_index += sum(self._qa_replay_is_interaction(action_name) for action_name in action_names)
+
+				with self._measure_qa_phase(f'{step.step_id}.after_evidence'):
+					last_snapshot = await self._capture_qa_snapshot(f'{step.step_id}_replay_after', include_screenshot=False)
+				replay_receipt = ActionReceipt(
+					status=(
+						ActionCompletionStatus.COMPLETED
+						if last_interaction_completed or not had_interactions
+						else ActionCompletionStatus.NOT_COMPLETED
+					),
+					operation_kind=step.operation_kind,
+					tool_succeeded=last_interaction_completed or not had_interactions,
+					state_changed=before.url != last_snapshot.url or before.dom_summary != last_snapshot.dom_summary,
+					side_effect_uncertain=step.side_effect_level == SideEffectLevel.IRREVERSIBLE
+					and not last_interaction_completed,
+					action_names=[name for _, names in prepared_items for name in names],
+					evidence_ids=last_snapshot.evidence_ids,
+					reasoning='Receipt derived from deterministic tool results and replayed browser state.',
+				)
+				evidence = StepEvidence(
+					before=before,
+					after=last_snapshot,
+					action_results=action_results,
+					action_receipt=replay_receipt,
+					evidence_quality=(EvidenceQuality.STRONG if last_snapshot.dom_summary.strip() else EvidenceQuality.WEAK),
+				)
+				if unsupported_reason:
+					judgement = StepJudgement(
+						action_status=ActionCompletionStatus.UNCERTAIN,
+						expectation_status=ExpectationStatus.NOT_OBSERVABLE,
+						status=QAStepStatus.INCONCLUSIVE,
+						failure_origin=FailureOrigin.UNKNOWN,
+						reasoning=unsupported_reason,
+						actual_result='The saved step contains an action that is not model-free.',
+					)
+				else:
+					judgement = self._judge_qa_replay_step(
+						step=step,
+						baseline=baseline_step,
+						evidence=evidence,
+						last_interaction_completed=last_interaction_completed,
+						had_interactions=had_interactions,
+					)
+				review = None
+				if judgement.status == QAStepStatus.SUT_FAILED:
+					review = ReviewRecord(
+						primary_status=QAStepStatus.SUT_FAILED,
+						secondary_status=QAStepStatus.SUT_FAILED,
+						agreed=True,
+						reviewer_model='deterministic-replay-validator',
+						reason='A separate deterministic assertion pass confirmed the same mismatch.',
+						evidence_ids=judgement.evidence_ids,
+					)
+				self._qa_step_results.append(
+					QAStepResult(
+						step=step,
+						status=judgement.status,
+						judgement=judgement,
+						review=review,
+						evidence=evidence,
+						attempt_receipts=[replay_receipt],
+					)
+				)
+				if judgement.status != QAStepStatus.PASSED:
+					may_fallback = (
+						self._qa_replay_allow_llm_fallback
+						and judgement.status in {QAStepStatus.AGENT_FAILED, QAStepStatus.INCONCLUSIVE}
+						and not replay_receipt.side_effect_uncertain
+					)
+					if may_fallback:
+						fallback_passed = await self._run_ai_fallback_for_replay_step(
+							step_index=step_index,
+							fallback_reason=judgement.reasoning,
+							max_steps=max_steps,
+							on_step_start=on_step_start,
+							on_step_end=on_step_end,
+						)
+						if fallback_passed:
+							continue
+						break
+					run_status, failure_origin = self._qa_run_status_for_step(judgement.status)
+					self._append_qa_replay_terminal_history(last_snapshot, judgement.actual_result)
+					self._finalize_qa_result(
+						status=run_status,
+						failure_origin=failure_origin,
+						stopped_at_step=step.step_id,
+						summary=f'{run_status.value} at {step.step_id}: {judgement.actual_result}',
+					)
+					break
+			else:
+				self._append_qa_replay_terminal_history(
+					last_snapshot,
+					f'PASSED: all {len(self._qa_test_case.steps)} steps passed deterministic replay.',
+				)
+				self._finalize_qa_result(
+					status=QARunStatus.PASSED,
+					failure_origin=FailureOrigin.NONE,
+					summary=f'PASSED: all {len(self._qa_test_case.steps)} steps passed deterministic replay.',
+				)
+		except Exception as exc:
+			status, origin = self._qa_runtime_failure_status(exc, phase='replay')
+			self._append_qa_replay_terminal_history(last_snapshot, f'{status.value}: {type(exc).__name__}: {exc}')
+			self._finalize_qa_result(
+				status=status,
+				failure_origin=origin,
+				failure_code=self._qa_runtime_failure_code(exc, phase='replay'),
+				summary=f'{status.value} during deterministic replay: {type(exc).__name__}: {exc}',
+			)
+		finally:
+			with self._measure_qa_phase('result_callbacks'):
+				self.history.usage = await self.token_cost_service.get_usage_summary()
+				await self._notify_qa_done_callback()
+			with self._measure_qa_phase('login_state_cache'):
+				await self._cache_qa_login_state()
+			await self.token_cost_service.log_usage_summary()
+			with self._measure_qa_phase('shutdown'):
+				await self.eventbus.stop(clear=True, timeout=_get_timeout('TIMEOUT_AgentEventBusStop', 3.0))
+				await self.close()
+			self._record_qa_phase_timing('replay_total', time.perf_counter() - replay_started_at)
+			self._sync_qa_phase_timings()
+		return self.history
 
 	async def _check_stop_or_pause(self) -> None:
 		"""Check if the agent should stop or pause, and handle accordingly."""
@@ -1175,6 +2086,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		)
 
 		try:
+			self._qa_llm_call_count += 1
 			model_output = await asyncio.wait_for(
 				self._get_model_output_with_retry(input_messages), timeout=self.settings.llm_timeout
 			)
@@ -1472,7 +2384,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self._message_manager._add_context_message(UserMessage(content=msg))
 
 	def _inject_exploration_nudge(self) -> None:
-		"""Nudge the agent to create a plan (or call done) after exploring without one."""
+		"""Nudge the agent to create a plan or submit the current QA step."""
 		if not self.settings.enable_planning or self.state.plan is not None:
 			return
 		if self.settings.planning_exploration_limit <= 0:
@@ -1482,7 +2394,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				'PLANNING NUDGE: You have taken '
 				f'{self.state.n_steps} steps without creating a plan. '
 				'If the task is complex, output a `plan_update` with clear todo items now. '
-				'If the task is already done or nearly done, call `done` instead.'
+				'If the current QA step is ready for judgement, call finish_test_step instead.'
 			)
 			self.logger.info(f'📋 Exploration nudge injected after {self.state.n_steps} steps without a plan')
 			self._message_manager._add_context_message(UserMessage(content=msg))
@@ -1507,7 +2419,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			return
 		# Actions to exclude: wait always hashes identically (instant false positive),
 		# done is terminal, go_back is navigation recovery
-		_LOOP_EXEMPT_ACTIONS = {'wait', 'done', 'go_back'}
+		_LOOP_EXEMPT_ACTIONS = {'wait', self._completion_action_name, 'go_back'}
 		for action in self.state.last_model_output.action:
 			action_data = action.model_dump(exclude_unset=True)
 			action_name = next(iter(action_data.keys()), 'unknown')
@@ -1553,7 +2465,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				f'({pct}%). {steps_remaining} steps remaining. '
 				f'If the task cannot be completed in the remaining steps, prioritize: '
 				f'(1) consolidate your results (save to files if the file system is in use), '
-				f'(2) call done with what you have. '
+				f'(2) call finish_test_step with the objective evidence you have. '
 				f'Partial results are far more valuable than exhausting all steps with nothing saved.'
 			)
 			self.logger.info(f'Step budget warning: {steps_used}/{step_info.max_steps} ({pct}%)')
@@ -1563,9 +2475,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		"""Handle special processing for the last step"""
 		if step_info and step_info.is_last_step():
 			# Add last step warning if needed
-			msg = 'You reached max_steps - this is your last step. Your only tool available is the "done" tool. No other tool is available. All other tools which you see in history or examples are not available.'
-			msg += '\nIf the task is not yet fully finished as requested by the user, set success in "done" to false! E.g. if not all steps are fully completed. Else success to true.'
-			msg += '\nInclude everything you found out for the ultimate task in the done text.'
+			msg = 'You reached max_steps. Your only available tool is finish_test_step.'
+			msg += '\nReport only the objective state reached for the current QA business step.'
+			msg += '\nSet side_effect_uncertain=true if an irreversible action may have happened.'
 			self.logger.debug('Last step finishing up')
 			self._message_manager._add_context_message(UserMessage(content=msg))
 			self.AgentOutput = self.DoneAgentOutput
@@ -1575,11 +2487,10 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		# Create recovery message
 		if self.state.consecutive_failures >= self.settings.max_failures and self.settings.final_response_after_failure:
 			msg = f'You failed {self.settings.max_failures} times. Therefore we terminate the agent.'
-			msg += '\nYour only tool available is the "done" tool. No other tool is available. All other tools which you see in history or examples are not available.'
-			msg += '\nIf the task is not yet fully finished as requested by the user, set success in "done" to false! E.g. if not all steps are fully completed. Else success to true.'
-			msg += '\nInclude everything you found out for the ultimate task in the done text.'
+			msg += '\nYour only available tool is finish_test_step. Report the objective state of the current QA step.'
+			msg += '\nSet side_effect_uncertain=true if an irreversible action may have happened.'
 
-			self.logger.debug('Force done action, because we reached max_failures.')
+			self.logger.debug('Force QA step submission because max_failures was reached.')
 			self._message_manager._add_context_message(UserMessage(content=msg))
 			self.AgentOutput = self.DoneAgentOutput
 
@@ -1687,10 +2598,12 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				action_instance = self.ActionModel()
 				setattr(
 					action_instance,
-					'done',
+					self._completion_action_name,
 					{
-						'success': False,
-						'text': 'No next action returned by LLM!',
+						'actual_result': 'The executor returned no action, so the current UI state was not established.',
+						'evidence': [],
+						'action_completed': False,
+						'side_effect_uncertain': False,
 					},
 				)
 				model_output.action = [action_instance]
@@ -2157,6 +3070,17 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 	def _log_final_outcome_messages(self) -> None:
 		"""Log helpful messages to user based on agent run outcome"""
+		qa_result = self.history.qa_result
+		if qa_result is not None:
+			if qa_result.status == QARunStatus.PASSED:
+				self.logger.info(f'✅ {qa_result.summary}')
+				return
+			if qa_result.status == QARunStatus.SUT_FAILED:
+				self.logger.info(f'❌ SUT expectation failed: {qa_result.summary}')
+				return
+			self.logger.warning(f'⚠️ QA run ended without a product verdict: {qa_result.summary}')
+			return
+
 		# Check if agent failed
 		is_successful = self.history.is_successful()
 
@@ -2210,6 +3134,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		judge_failure_reason = judgement_data.get('failure_reason') if judgement_data else None
 		judge_reached_captcha = judgement_data.get('reached_captcha') if judgement_data else None
 		judge_impossible_task = judgement_data.get('impossible_task') if judgement_data else None
+		qa_result = self.history.qa_result
 
 		self.telemetry.capture(
 			AgentTelemetryEvent(
@@ -2242,43 +3167,20 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				judge_failure_reason=judge_failure_reason,
 				judge_reached_captcha=judge_reached_captcha,
 				judge_impossible_task=judge_impossible_task,
+				qa_status=qa_result.status.value if qa_result else None,
+				qa_failure_origin=qa_result.failure_origin.value if qa_result and qa_result.failure_origin else None,
+				qa_stopped_at_step=qa_result.stopped_at_step if qa_result else None,
+				qa_total_steps=len(qa_result.test_case.steps) if qa_result and qa_result.test_case else None,
+				qa_executed_steps=(
+					sum(1 for result in qa_result.step_results if result.status != QAStepStatus.NOT_RUN) if qa_result else None
+				),
 			)
 		)
 
 	async def take_step(self, step_info: AgentStepInfo | None = None) -> tuple[bool, bool]:
-		"""Take a step
+		"""Reject bypassing QA compilation and per-step independent judgement."""
 
-		Returns:
-		        Tuple[bool, bool]: (is_done, is_valid)
-		"""
-		if step_info is not None and step_info.step_number == 0:
-			# First step
-			self._log_first_step_startup()
-			# Normally there was no try catch here but the callback can raise an InterruptedError which we skip
-			try:
-				await self._execute_initial_actions()
-			except InterruptedError:
-				pass
-			except Exception as e:
-				raise e
-
-		await self.step(step_info)
-
-		if self.history.is_done():
-			await self.log_completion()
-
-			# Run full judge before done callback if enabled
-			if self.settings.use_judge:
-				await self._judge_and_log()
-
-			if self.register_done_callback:
-				if inspect.iscoroutinefunction(self.register_done_callback):
-					await self.register_done_callback(self.history)
-				else:
-					self.register_done_callback(self.history)
-			return True, True
-
-		return False, False
+		raise RuntimeError('browser_use.Agent.take_step() cannot bypass the QA runner; use Agent.run()')
 
 	def _extract_start_url(self, task: str) -> str | None:
 		"""Extract URL from task string using naive pattern matching."""
@@ -2485,21 +3387,1319 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			await on_step_end(self)
 
 		if self.history.is_done():
-			await self.log_completion()
-
-			# Run full judge before done callback if enabled
-			if self.settings.use_judge:
-				await self._judge_and_log()
-
-			if self.register_done_callback:
-				if inspect.iscoroutinefunction(self.register_done_callback):
-					await self.register_done_callback(self.history)
-				else:
-					self.register_done_callback(self.history)
-
+			# In QA mode this is only a business-step boundary. run() invokes the
+			# independent judge and decides whether to advance, retry, or terminate.
 			return True
 
 		return False
+
+	def _qa_step_prompt(self, step: WebUITestStep, *, retry_reason: str | None = None) -> str:
+		assert self._qa_test_case is not None
+		case_preconditions = [str(getattr(item, 'description', item)) for item in self._qa_test_case.preconditions]
+		step_preconditions = [str(getattr(item, 'description', item)) for item in step.preconditions]
+		retry_section = ''
+		if retry_reason:
+			retry_section = f'\nPrevious attempt was not objectively completed. Recovery reason: {retry_reason}\n'
+		phase_heading = (
+			f'QA CLEANUP {self._qa_cleanup_index + 1}/{len(self._qa_test_case.cleanup_steps)}'
+			if self._qa_running_cleanup
+			else f'QA STEP {self._qa_current_step_index + 1}/{len(self._qa_test_case.steps)}'
+		)
+		resolved_test_data = {
+			key: value.replace('${run_id}', self._qa_run_id) for key, value in self._qa_test_case.test_data.items()
+		}
+		idempotency_key = step.idempotency_key.replace('${run_id}', self._qa_run_id) if step.idempotency_key else None
+		return f"""{phase_heading}
+Step ID: {step.step_id}
+Run ID: {self._qa_run_id}
+Idempotency key: {idempotency_key}
+Non-sensitive test data: {resolved_test_data}
+Test case preconditions: {case_preconditions}
+Business action: {step.instruction}
+Expected observable result: {step.expected_result}
+Expectation source: {step.expectation_source.value}
+Step preconditions: {step_preconditions}
+{retry_section}
+Execute only this business step. Use the current page as the source of truth. When the resulting state is observable,
+call finish_test_step alone with objective evidence. Do not decide pass/fail and do not continue to another business step."""
+
+	def _qa_preconditions_prompt(self, step: WebUITestStep) -> str:
+		assert self._qa_test_case is not None
+		lines = [
+			f'- {item.mode.value.upper()} {item.precondition_id}: {item.description}' for item in self._qa_test_case.preconditions
+		]
+		return f"""QA PRECONDITION PHASE
+Required conditions:
+{chr(10).join(lines)}
+
+VERIFY conditions must only be inspected. ENSURE conditions may perform the stated setup, such as authentication.
+Do not execute business test steps. If a required credential, role, test datum, CAPTCHA, or dependency blocks setup,
+report that objective state. When all conditions are satisfied or a blocker is observable, call finish_test_step alone.
+Expected state: {step.expected_result}"""
+
+	def _available_sensitive_reference_names(self) -> set[str]:
+		names: set[str] = set()
+		for key, value in (self.sensitive_data or {}).items():
+			if isinstance(value, dict):
+				names.update(str(nested_key) for nested_key in value)
+			else:
+				names.add(str(key))
+		return names
+
+	def _redact_qa_text(self, value: str) -> str:
+		"""Redact registered sensitive values before evidence reaches disk or a Judge."""
+
+		sensitive_values = collect_sensitive_data_values(self.sensitive_data)
+		return redact_sensitive_string(value, sensitive_values) if sensitive_values else value
+
+	def _create_qa_artifact(
+		self,
+		*,
+		kind: EvidenceKind,
+		summary: str,
+		url: str | None = None,
+		artifact_path: str | None = None,
+		metadata: dict[str, Any] | None = None,
+		redacted: bool = True,
+	) -> EvidenceArtifact:
+		"""Create a content-addressed evidence record for one captured observation."""
+
+		redacted_summary = self._redact_qa_text(summary)
+		digest_source = redacted_summary.encode('utf-8')
+		if artifact_path:
+			try:
+				digest_source = Path(artifact_path).read_bytes()
+			except OSError:
+				pass
+		return EvidenceArtifact(
+			kind=kind,
+			tab_id=self.browser_session.agent_focus_target_id,
+			url=url,
+			summary=redacted_summary[:4000],
+			artifact_path=artifact_path,
+			sha256=hashlib.sha256(digest_source).hexdigest(),
+			redacted=redacted,
+			metadata=metadata or {},
+		)
+
+	async def _capture_qa_snapshot(self, label: str, *, include_screenshot: bool | None = None) -> BrowserEvidenceSnapshot:
+		if include_screenshot is None:
+			include_screenshot = self.settings.use_vision is not False
+		state = await self.browser_session.get_browser_state_summary(
+			include_screenshot=include_screenshot, include_recent_events=True
+		)
+		diagnostics = self._qa_evidence_monitor.since(self._qa_evidence_cursor) if self._qa_evidence_monitor is not None else None
+		dom_summary = ''
+		try:
+			dom_summary = self._redact_qa_text(
+				state.dom_state.llm_representation(include_attributes=self.settings.include_attributes)[:30000]
+			)
+		except Exception as exc:
+			dom_summary = f'Unable to serialize DOM evidence: {type(exc).__name__}: {exc}'
+
+		evidence_dir = self.agent_directory / 'qa_evidence'
+		evidence_dir.mkdir(parents=True, exist_ok=True)
+		safe_label = re.sub(r'[^A-Za-z0-9_.-]+', '_', label)
+		artifacts: list[EvidenceArtifact] = []
+		dom_path = evidence_dir / f'{safe_label}.dom.txt'
+		try:
+			dom_path.write_text(dom_summary, encoding='utf-8')
+			artifacts.append(
+				self._create_qa_artifact(
+					kind=EvidenceKind.DOM,
+					summary=dom_summary,
+					url=state.url,
+					artifact_path=str(dom_path),
+					metadata={'label': label},
+				)
+			)
+		except OSError as exc:
+			self.logger.warning(f'Failed to persist QA DOM evidence: {exc}')
+		artifacts.append(self._create_qa_artifact(kind=EvidenceKind.URL, summary=state.url, url=state.url))
+
+		screenshot_path: str | None = None
+		# Screenshots can contain secrets that cannot be reliably text-redacted. When
+		# sensitive values are registered, rely on redacted DOM evidence instead.
+		if state.screenshot and not collect_sensitive_data_values(self.sensitive_data):
+			try:
+				path = evidence_dir / f'{safe_label}.png'
+				path.write_bytes(base64.b64decode(state.screenshot))
+				screenshot_path = str(path)
+				artifacts.append(
+					self._create_qa_artifact(
+						kind=EvidenceKind.SCREENSHOT,
+						summary=f'Screenshot captured at {state.url}',
+						url=state.url,
+						artifact_path=screenshot_path,
+						redacted=True,
+					)
+				)
+			except Exception as exc:
+				self.logger.warning(f'Failed to persist QA screenshot evidence: {exc}')
+
+		browser_errors = [self._redact_qa_text(str(item)) for item in state.browser_errors]
+		network_errors = [self._redact_qa_text(str(item)) for item in diagnostics.network_errors] if diagnostics else []
+		console_errors = [self._redact_qa_text(str(item)) for item in diagnostics.console_errors] if diagnostics else []
+		for kind, messages in (
+			(EvidenceKind.BROWSER, browser_errors),
+			(EvidenceKind.NETWORK, network_errors),
+			(EvidenceKind.CONSOLE, console_errors),
+		):
+			for message in messages:
+				artifacts.append(self._create_qa_artifact(kind=kind, summary=message, url=state.url))
+		if diagnostics:
+			for event in diagnostics.network_events:
+				safe_url = self._redact_qa_text(event.url)
+				summary = (
+					f'{event.method} {event.status if event.status is not None else "FAILED"} [{event.resource_type}] {safe_url}'
+				)
+				artifacts.append(
+					self._create_qa_artifact(
+						kind=EvidenceKind.NETWORK,
+						summary=summary,
+						url=state.url,
+						metadata={
+							'request_id': event.request_id,
+							'method': event.method,
+							'url': safe_url,
+							'resource_type': event.resource_type,
+							'status': event.status,
+							'error': self._redact_qa_text(event.error or '') or None,
+						},
+					)
+				)
+
+		return BrowserEvidenceSnapshot(
+			url=state.url,
+			title=state.title,
+			dom_summary=dom_summary,
+			screenshot_path=screenshot_path,
+			browser_errors=browser_errors,
+			network_errors=network_errors,
+			console_errors=console_errors,
+			recent_events=self._redact_qa_text(state.recent_events) if state.recent_events else None,
+			artifacts=artifacts,
+		)
+
+	async def _capture_qa_lightweight_snapshot(self) -> BrowserEvidenceSnapshot:
+		"""Capture a replay boundary without rebuilding the full DOM tree.
+
+		The deterministic replay judge only evaluates post-action assertions. The
+		pre-action snapshot therefore needs the cached page identity and diagnostic
+		cursor, while the full DOM remains reserved for post-action evidence.
+		"""
+
+		diagnostics = self._qa_evidence_monitor.since(self._qa_evidence_cursor) if self._qa_evidence_monitor else None
+		return BrowserEvidenceSnapshot(
+			url=await self.browser_session.get_current_page_url(),
+			title=await self.browser_session.get_current_page_title(),
+			network_errors=diagnostics.network_errors if diagnostics else [],
+			console_errors=diagnostics.console_errors if diagnostics else [],
+		)
+
+	async def _wait_for_qa_page_stability(self, *, timeout: float = 8.0, stable_window: float = 0.4) -> None:
+		"""Wait for URL/title/DOM state to stabilize instead of using a fixed sleep."""
+
+		deadline = time.monotonic() + timeout
+		last_signature: str | None = None
+		stable_since = time.monotonic()
+		while time.monotonic() < deadline:
+			state = await self.browser_session.get_browser_state_summary(include_screenshot=False)
+			try:
+				dom = state.dom_state.llm_representation(include_attributes=self.settings.include_attributes)[:12000]
+			except Exception:
+				dom = ''
+			signature = hashlib.sha256(f'{state.url}\0{state.title}\0{dom}'.encode()).hexdigest()
+			now = time.monotonic()
+			if signature != last_signature:
+				last_signature = signature
+				stable_since = now
+			elif now - stable_since >= stable_window:
+				return
+			await asyncio.sleep(0.1)
+		self._qa_warnings.append(f'Page did not reach a stable DOM window within {timeout:.1f}s')
+
+	@staticmethod
+	def _qa_storage_maps(storage_state: dict[str, Any], root_origin: str) -> tuple[dict[str, str], dict[str, str]]:
+		for origin in storage_state.get('origins', []):
+			if origin.get('origin') != root_origin:
+				continue
+			local = {str(item['name']): str(item['value']) for item in origin.get('localStorage', [])}
+			session = {str(item['name']): str(item['value']) for item in origin.get('sessionStorage', [])}
+			return local, session
+		return {}, {}
+
+	def _filter_qa_login_storage_state(self, storage_state: dict[str, Any]) -> dict[str, Any]:
+		"""Keep only cookies and web storage belonging to the current QA navigation scope."""
+
+		if self._qa_scope is None:
+			return {'cookies': [], 'origins': []}
+		scope = self._qa_scope
+
+		def cookie_domain_allowed(cookie: dict[str, Any]) -> bool:
+			host = str(cookie.get('domain', '')).lstrip('.').rstrip('.').lower()
+			if not host:
+				return False
+			if scope.exact_host_only:
+				return host == scope.root_host
+			return host == scope.registrable_domain or host.endswith(f'.{scope.registrable_domain}')
+
+		cookies = [dict(cookie) for cookie in storage_state.get('cookies', []) if cookie_domain_allowed(dict(cookie))]
+		origins = [dict(origin) for origin in storage_state.get('origins', []) if scope.allows(str(origin.get('origin', '')))]
+		return {'cookies': cookies, 'origins': origins}
+
+	async def _cache_qa_login_state(self) -> None:
+		"""Capture in-scope authentication state in memory for a later same-Agent run."""
+
+		if not self.settings.reuse_login_state or self._qa_scope is None or self.browser_session._cdp_client_root is None:
+			return
+		try:
+			storage_state = await self.browser_session._cdp_get_storage_state()
+			self._qa_login_storage_state = self._filter_qa_login_storage_state(storage_state)
+		except Exception as exc:
+			self.logger.debug(f'Could not cache QA login state: {type(exc).__name__}: {exc}')
+
+	async def _restore_cached_qa_login_state(self) -> None:
+		"""Restore cached in-scope credentials before the repeated run navigates to its root page."""
+
+		if not self.settings.reuse_login_state or not self._qa_login_storage_state:
+			return
+		if not self._qa_login_storage_state.get('cookies') and not self._qa_login_storage_state.get('origins'):
+			return
+		try:
+			cookies = []
+			for raw_cookie in self._qa_login_storage_state.get('cookies', []):
+				cookie = dict(raw_cookie)
+				if cookie.get('expires') in {0, 0.0, -1, -1.0}:
+					cookie.pop('expires', None)
+				cookies.append(cookie)
+			if cookies:
+				await self.browser_session._cdp_set_cookies(cookies)
+
+			for origin in self._qa_login_storage_state.get('origins', []):
+				origin_value = origin.get('origin')
+				if not origin_value:
+					continue
+				local_storage = {str(item['name']): str(item['value']) for item in origin.get('localStorage', [])}
+				session_storage = {str(item['name']): str(item['value']) for item in origin.get('sessionStorage', [])}
+				restore_script = f"""(() => {{
+					if (window.location.origin !== {json.dumps(origin_value)}) return;
+					const localValues = {json.dumps(local_storage)};
+					const sessionValues = {json.dumps(session_storage)};
+					for (const [key, value] of Object.entries(localValues)) window.localStorage.setItem(key, value);
+					for (const [key, value] of Object.entries(sessionValues)) window.sessionStorage.setItem(key, value);
+				}})();"""
+				await self.browser_session._cdp_add_init_script(restore_script)
+			self.logger.info('🔐 Reused in-scope login state from the previous QA run.')
+		except Exception as exc:
+			self.logger.warning(f'Could not restore cached QA login state; login may be required again: {exc}')
+
+	async def _restore_qa_exploration_state(
+		self,
+		*,
+		storage_state: dict[str, Any],
+		original_target_id: str,
+		original_tab_ids: set[str],
+		root_origin: str,
+	) -> None:
+		"""Close exploration pages and restore cookies plus root-origin web storage."""
+
+		try:
+			current_tabs = await self.browser_session.get_tabs()
+			if original_target_id in {tab.target_id for tab in current_tabs}:
+				await self.browser_session.event_bus.dispatch(SwitchTabEvent(target_id=original_target_id))
+			for tab in current_tabs:
+				if tab.target_id not in original_tab_ids:
+					await self.browser_session._cdp_close_page(tab.target_id)
+
+			await self.browser_session._cdp_clear_cookies()
+			cookies = storage_state.get('cookies', [])
+			if cookies:
+				await self.browser_session._cdp_set_cookies(cookies)
+
+			await self.browser_session.navigate_to(self._qa_scope.root_url, new_tab=False)  # type: ignore[union-attr]
+			await self._wait_for_qa_page_stability()
+			local_storage, session_storage = self._qa_storage_maps(storage_state, root_origin)
+			restore_script = f"""(() => {{
+				if (window.location.origin !== {json.dumps(root_origin)}) return 'wrong-origin';
+				localStorage.clear();
+				sessionStorage.clear();
+				const localItems = {json.dumps(local_storage)};
+				const sessionItems = {json.dumps(session_storage)};
+				for (const [key, value] of Object.entries(localItems)) localStorage.setItem(key, value);
+				for (const [key, value] of Object.entries(sessionItems)) sessionStorage.setItem(key, value);
+				return 'restored';
+			}})()"""
+			cdp_session = await self.browser_session.get_or_create_cdp_session()
+			result = await cdp_session.cdp_client.send.Runtime.evaluate(
+				params={'expression': restore_script, 'returnByValue': True}, session_id=cdp_session.session_id
+			)
+			if result.get('result', {}).get('value') != 'restored':
+				raise QAExplorationStateError('Exploration storage restoration ran on an unexpected origin')
+
+			# Reload so the SUT consumes the restored storage before formal execution.
+			await self.browser_session.navigate_to(self._qa_scope.root_url, new_tab=False)  # type: ignore[union-attr]
+			await self._wait_for_qa_page_stability()
+			state = await self.browser_session.get_browser_state_summary(include_screenshot=False)
+			if not self._qa_scope or not self._qa_scope.allows(state.url):
+				raise QAExplorationStateError(f'Restored page left QA scope: {state.url}')
+			verified_storage = await self.browser_session._cdp_get_storage_state()
+			verified_local, verified_session = self._qa_storage_maps(verified_storage, root_origin)
+			if verified_local != local_storage or verified_session != session_storage:
+				raise QAExplorationStateError(
+					'Page storage changed after restoration reload; clean formal state cannot be confirmed',
+					inconclusive=True,
+				)
+		except QAExplorationStateError:
+			raise
+		except Exception as exc:
+			raise QAExplorationStateError(f'Failed to restore read-only exploration state: {exc}') from exc
+
+	def _qa_root_origin(self) -> str:
+		"""Return the normalized origin used for root-scoped storage migration."""
+
+		assert self._qa_scope is not None
+		parsed_root = urlparse(self._qa_scope.root_url)
+		root_host = self._qa_scope.root_host
+		if ':' in root_host and not root_host.startswith('['):
+			root_host = f'[{root_host}]'
+		default_port = (parsed_root.scheme == 'https' and parsed_root.port in {None, 443}) or (
+			parsed_root.scheme == 'http' and parsed_root.port in {None, 80}
+		)
+		return f'{parsed_root.scheme}://{root_host}' + ('' if default_port else f':{parsed_root.port}')
+
+	async def _compile_qa_case_from_exploration_page(
+		self,
+		*,
+		compiler: QATaskCompiler,
+		draft: WebUITestCaseDraft,
+	) -> WebUITestCase:
+		"""Collect passive page evidence from the focused exploration target."""
+
+		assert self._qa_scope is not None
+		await self._wait_for_qa_page_stability()
+		initial = await self.browser_session.get_browser_state_summary(include_screenshot=True, include_recent_events=True)
+		if initial.state_error:
+			raise RuntimeError(f'Unable to inspect QA root page: {initial.state_error}')
+		await self.browser_session.event_bus.dispatch(ScrollEvent(direction='down', amount=700, node=None))
+		await self._wait_for_qa_page_stability(timeout=2.0, stable_window=0.2)
+		scrolled = await self.browser_session.get_browser_state_summary(include_screenshot=False, include_recent_events=True)
+		await self.browser_session.event_bus.dispatch(ScrollEvent(direction='up', amount=700, node=None))
+		dom_parts: list[str] = []
+		for state in (initial, scrolled):
+			try:
+				dom_parts.append(state.dom_state.llm_representation(include_attributes=self.settings.include_attributes))
+			except Exception as exc:
+				raise RuntimeError(f'Unable to serialize QA discovery state: {exc}') from exc
+		return await compiler.complete_with_discovery(
+			draft=draft,
+			scope=self._qa_scope,
+			discovered_url=scrolled.url,
+			discovered_title=scrolled.title,
+			discovered_dom='\n\n--- SCROLLED READ-ONLY VIEW ---\n'.join(dom_parts),
+		)
+
+	async def _explore_in_isolated_browser_context(
+		self,
+		*,
+		compiler: QATaskCompiler,
+		draft: WebUITestCaseDraft,
+		storage_state: dict[str, Any],
+		original_target_id: str,
+		root_origin: str,
+	) -> WebUITestCase:
+		"""Explore in a disposable CDP context containing only in-scope auth state."""
+
+		assert self._qa_scope is not None
+		root_client = self.browser_session._cdp_client_root
+		if root_client is None:
+			raise QAIsolatedContextUnavailable('Root CDP client is unavailable')
+
+		context_id: str | None = None
+		isolated_target_id: str | None = None
+		context_ready = False
+		try:
+			created = await asyncio.wait_for(root_client.send.Target.createBrowserContext(params={}), timeout=8.0)
+			context_id = created.get('browserContextId')
+			if not context_id:
+				raise QAIsolatedContextUnavailable('CDP did not return a browserContextId')
+
+			filtered_storage = self._filter_qa_login_storage_state(storage_state)
+			cookies = []
+			for raw_cookie in filtered_storage.get('cookies', []):
+				cookie = dict(raw_cookie)
+				if cookie.get('expires') in {0, 0.0, -1, -1.0}:
+					cookie.pop('expires', None)
+				cookies.append(cookie)
+			if cookies:
+				await asyncio.wait_for(
+					root_client.send.Storage.setCookies(params={'cookies': cookies, 'browserContextId': context_id}),
+					timeout=8.0,
+				)
+
+			created_target = await asyncio.wait_for(
+				root_client.send.Target.createTarget(params={'url': 'about:blank', 'browserContextId': context_id}),
+				timeout=8.0,
+			)
+			target_id = created_target.get('targetId')
+			if not target_id:
+				raise QAIsolatedContextUnavailable('CDP did not create an isolated exploration target')
+			isolated_target_id = target_id
+			cdp_session = await self.browser_session.get_or_create_cdp_session(target_id, focus=True)
+			local_storage, session_storage = self._qa_storage_maps(filtered_storage, root_origin)
+			restore_script = f"""(() => {{
+				if (window.location.origin !== {json.dumps(root_origin)}) return;
+				const localItems = {json.dumps(local_storage)};
+				const sessionItems = {json.dumps(session_storage)};
+				for (const [key, value] of Object.entries(localItems)) localStorage.setItem(key, value);
+				for (const [key, value] of Object.entries(sessionItems)) sessionStorage.setItem(key, value);
+			}})();"""
+			await asyncio.wait_for(
+				cdp_session.cdp_client.send.Page.addScriptToEvaluateOnNewDocument(
+					params={'source': restore_script}, session_id=cdp_session.session_id
+				),
+				timeout=8.0,
+			)
+			await asyncio.wait_for(
+				cdp_session.cdp_client.send.Page.navigate(
+					params={'url': self._qa_scope.root_url}, session_id=cdp_session.session_id
+				),
+				timeout=8.0,
+			)
+			context_ready = True
+			return await self._compile_qa_case_from_exploration_page(compiler=compiler, draft=draft)
+		except QAIsolatedContextUnavailable:
+			raise
+		except Exception as exc:
+			if context_ready:
+				raise
+			raise QAIsolatedContextUnavailable(f'CDP isolated-context setup failed: {exc}') from exc
+		finally:
+			try:
+				current_tabs = await self.browser_session.get_tabs()
+				if original_target_id in {tab.target_id for tab in current_tabs}:
+					switch_event = self.browser_session.event_bus.dispatch(SwitchTabEvent(target_id=original_target_id))
+					await switch_event
+					await switch_event.event_result(raise_if_any=False, raise_if_none=False)
+			finally:
+				if context_id:
+					try:
+						await asyncio.wait_for(
+							root_client.send.Target.disposeBrowserContext(params={'browserContextId': context_id}), timeout=8.0
+						)
+					except Exception as exc:
+						self._qa_warnings.append(f'Could not dispose isolated QA exploration context: {exc}')
+				if isolated_target_id:
+					for _ in range(20):
+						if isolated_target_id not in {tab.target_id for tab in await self.browser_session.get_tabs()}:
+							break
+						await asyncio.sleep(0.05)
+
+	async def _explore_and_complete_qa_case(self, *, compiler: QATaskCompiler, draft: WebUITestCaseDraft) -> WebUITestCase:
+		"""Gather passive evidence in a disposable context, with snapshot fallback."""
+
+		assert self._qa_scope is not None
+		tabs_before = await self.browser_session.get_tabs()
+		original_tab_ids = {tab.target_id for tab in tabs_before}
+		original_target_id = self.browser_session.agent_focus_target_id
+		if not original_target_id:
+			raise QAExplorationStateError('No focused page is available for QA exploration')
+		storage_state = await self.browser_session._cdp_get_storage_state()
+		root_origin = self._qa_root_origin()
+
+		try:
+			compiled = await self._explore_in_isolated_browser_context(
+				compiler=compiler,
+				draft=draft,
+				storage_state=storage_state,
+				original_target_id=original_target_id,
+				root_origin=root_origin,
+			)
+			# The disposable context owns its navigation. The formal browser must now
+			# perform its single runner-owned root navigation before business steps.
+			await self.browser_session.navigate_to(self._qa_scope.root_url, new_tab=False)
+			await self._wait_for_qa_page_stability()
+			self.logger.info('🧪 Completed read-only discovery in an isolated CDP BrowserContext.')
+			return compiled
+		except QAIsolatedContextUnavailable as exc:
+			self._qa_warnings.append(f'Isolated exploration unavailable; used snapshot restoration fallback: {exc}')
+
+		compiled_case: WebUITestCase | None = None
+		primary_error: Exception | None = None
+		try:
+			await self.browser_session.navigate_to(self._qa_scope.root_url, new_tab=True)
+			compiled_case = await self._compile_qa_case_from_exploration_page(compiler=compiler, draft=draft)
+		except Exception as exc:
+			primary_error = exc
+		finally:
+			try:
+				await self._restore_qa_exploration_state(
+					storage_state=storage_state,
+					original_target_id=original_target_id,
+					original_tab_ids=original_tab_ids,
+					root_origin=root_origin,
+				)
+			except Exception:
+				# Restoration uncertainty outranks compiler errors because continuing could
+				# create false product failures from contaminated browser state.
+				raise
+		if primary_error is not None:
+			raise primary_error
+		assert compiled_case is not None
+		return compiled_case
+
+	async def _prepare_qa_case(self, draft: WebUITestCaseDraft) -> None:
+		"""Compile missing expectations and establish a clean formal baseline."""
+
+		assert self._qa_scope is not None
+		compiler = QATaskCompiler(self.judge_llm)
+		try:
+			if draft.needs_exploration:
+				self._qa_phase = 'exploration'
+				self._qa_test_case = await self._explore_and_complete_qa_case(compiler=compiler, draft=draft)
+			else:
+				self._qa_test_case = await compiler.complete_with_discovery(
+					draft=draft,
+					scope=self._qa_scope,
+					discovered_url=self._qa_scope.root_url,
+					discovered_title='',
+					discovered_dom='',
+				)
+				await self.browser_session.navigate_to(self._qa_scope.root_url, new_tab=False)
+				await self._wait_for_qa_page_stability()
+		finally:
+			self._qa_llm_call_count += compiler.call_count
+
+		self._qa_compiled_task = self._qa_original_task
+		self._log_qa_test_case_table('📋 Structured QA test case')
+		await self._start_qa_execution()
+
+	async def _prepare_reused_qa_case(self) -> None:
+		"""Restore the root page and execute an already validated test case without recompilation."""
+
+		assert self._qa_scope is not None
+		assert self._qa_test_case is not None
+		self._log_qa_test_case_table('♻️ Reused structured QA test case')
+		await self.browser_session.navigate_to(self._qa_scope.root_url, new_tab=False)
+		await self._wait_for_qa_page_stability()
+		await self._start_qa_execution()
+
+	def _log_qa_test_case_table(self, label: str) -> None:
+		"""Log the compiled table without exposing values registered as sensitive data."""
+
+		assert self._qa_test_case is not None
+		table = self._qa_test_case.to_markdown_table()
+		sensitive_values = collect_sensitive_data_values(self.sensitive_data)
+		if sensitive_values:
+			table = redact_sensitive_string(table, sensitive_values)
+		self.logger.info(f'{label}:\n{table}')
+
+	async def _start_qa_execution(self) -> None:
+		"""Initialize per-run QA execution state after compilation or cache reuse."""
+
+		assert self._qa_test_case is not None
+		self._qa_phase = 'execution'
+		self._qa_current_step_index = 0
+		self._qa_step_retry_count = 0
+		self._qa_step_results = []
+		self._qa_current_attempt_receipts = []
+		self._qa_step_history_start = len(self.history.history)
+		self._qa_evidence_cursor = self._qa_evidence_monitor.cursor() if self._qa_evidence_monitor else None
+		self._qa_before_snapshot = await self._capture_qa_snapshot('preconditions_or_step_1_before')
+		if self._qa_test_case.preconditions:
+			available_sensitive_refs = self._available_sensitive_reference_names()
+			missing_refs = sorted(
+				{
+					ref
+					for item in self._qa_test_case.preconditions
+					if item.required
+					for ref in item.sensitive_refs
+					if ref not in available_sensitive_refs
+				}
+			)
+			if missing_refs:
+				self._qa_precondition_results = [
+					QAPreconditionResult(
+						precondition=item,
+						status=(
+							PreconditionStatus.BLOCKED
+							if any(ref in missing_refs for ref in item.sensitive_refs)
+							else PreconditionStatus.NOT_CHECKED
+						),
+						reason=f'Missing sensitive-data references: {missing_refs}',
+					)
+					for item in self._qa_test_case.preconditions
+				]
+				self._finalize_qa_result(
+					status=QARunStatus.BLOCKED,
+					failure_origin=FailureOrigin.ENVIRONMENT,
+					failure_code=FailureCode.ENV_AUTH_REQUIRED,
+					summary=f'BLOCKED: required sensitive data is missing: {missing_refs}',
+				)
+				return
+
+			self._qa_running_preconditions = True
+			self._qa_phase = 'preconditions'
+			ensure_mode = any(item.mode == PreconditionMode.ENSURE for item in self._qa_test_case.preconditions)
+			self._qa_precondition_step = WebUITestStep(
+				step_id='__preconditions__',
+				instruction='; '.join(item.description for item in self._qa_test_case.preconditions),
+				expected_result='Every required precondition is satisfied before business-step execution.',
+				expectation_source=ExpectationSource.EXPLICIT,
+				source_evidence=[item.description for item in self._qa_test_case.preconditions],
+				operation_kind=StepOperationKind.SUBMIT if ensure_mode else StepOperationKind.OBSERVE,
+				side_effect_level=SideEffectLevel.REVERSIBLE if ensure_mode else SideEffectLevel.NONE,
+			)
+			self._message_manager.add_new_task(self._qa_preconditions_prompt(self._qa_precondition_step))
+			return
+
+		self._message_manager.add_new_task(self._qa_step_prompt(self._qa_test_case.steps[0]))
+
+	@staticmethod
+	def _qa_effective_operation(step: WebUITestStep, action_names: list[str]) -> StepOperationKind:
+		if step.operation_kind != StepOperationKind.OTHER:
+			return step.operation_kind
+		if any(name in {'click', 'click_element', 'click_element_by_index'} for name in action_names):
+			return StepOperationKind.CLICK
+		if any(name in {'input', 'input_text', 'type'} for name in action_names):
+			return StepOperationKind.INPUT
+		if any(name in {'navigate', 'go_to_url', 'open_tab'} for name in action_names):
+			return StepOperationKind.NAVIGATE
+		if not action_names:
+			return StepOperationKind.OBSERVE
+		return StepOperationKind.OTHER
+
+	@staticmethod
+	def _qa_selected_element_matches(step: WebUITestStep, selected: dict[str, Any] | None) -> bool | None:
+		"""Conservatively match an interacted element to the business instruction."""
+
+		if selected is None:
+			return None
+		candidate_values = [
+			str(selected.get('ax_name') or ''),
+			str(selected.get('node_value') or ''),
+		]
+		attributes = selected.get('attributes') or {}
+		for key in ('aria-label', 'title', 'name', 'placeholder', 'value'):
+			candidate_values.append(str(attributes.get(key) or ''))
+		instruction = re.sub(r'\s+', '', step.instruction).casefold()
+		labels = [re.sub(r'\s+', '', value).casefold() for value in candidate_values if value.strip()]
+		if not labels:
+			return None
+		return any(label in instruction or instruction in label for label in labels if len(label) >= 1)
+
+	def _build_action_receipt(
+		self,
+		*,
+		step: WebUITestStep,
+		before: BrowserEvidenceSnapshot,
+		after: BrowserEvidenceSnapshot,
+		action_results: list[dict[str, Any]],
+		action_names: list[str],
+		selected_element: dict[str, Any] | None,
+		input_values: list[str],
+		side_effect_uncertain: bool,
+	) -> tuple[ActionReceipt, EvidenceArtifact]:
+		if selected_element is not None:
+			selected_element = json.loads(self._redact_qa_text(json.dumps(selected_element, ensure_ascii=False)))
+		operation = self._qa_effective_operation(step, action_names)
+		errors = [str(result.get('error')) for result in action_results if result.get('error')]
+		tool_succeeded = not errors and (bool(action_results) or operation == StepOperationKind.OBSERVE)
+		target_matched = (
+			True
+			if operation in {StepOperationKind.OBSERVE, StepOperationKind.NAVIGATE}
+			else self._qa_selected_element_matches(step, selected_element)
+		)
+		state_changed = before.url != after.url or before.dom_summary != after.dom_summary
+		related_network = [
+			artifact
+			for artifact in after.artifacts
+			if artifact.kind == EvidenceKind.NETWORK and artifact.metadata.get('request_id')
+		]
+		confirmed_request = any(
+			str(artifact.metadata.get('method', 'GET')).upper() in {'POST', 'PUT', 'PATCH', 'DELETE'}
+			and isinstance(artifact.metadata.get('status'), int)
+			and 200 <= int(artifact.metadata['status']) < 400
+			for artifact in related_network
+		)
+		if (
+			step.side_effect_level == SideEffectLevel.IRREVERSIBLE
+			and bool(action_names)
+			and not (state_changed or confirmed_request)
+		):
+			side_effect_uncertain = True
+
+		if side_effect_uncertain:
+			status = ActionCompletionStatus.UNCERTAIN
+			reasoning = 'A side-effecting action may have completed and cannot be safely replayed.'
+		elif errors:
+			status = ActionCompletionStatus.NOT_COMPLETED
+			reasoning = f'Tool execution failed: {errors[0]}'
+		elif operation == StepOperationKind.OBSERVE and after.dom_summary.strip():
+			status = ActionCompletionStatus.COMPLETED
+			reasoning = 'The observation step captured objective page evidence.'
+		elif not tool_succeeded:
+			status = ActionCompletionStatus.NOT_COMPLETED
+			reasoning = 'No successful tool action was recorded for the business step.'
+		elif target_matched is False:
+			status = ActionCompletionStatus.NOT_COMPLETED
+			reasoning = 'The interacted element does not match the target described by the business step.'
+		elif target_matched is None and operation in {
+			StepOperationKind.CLICK,
+			StepOperationKind.INPUT,
+			StepOperationKind.SUBMIT,
+		}:
+			status = ActionCompletionStatus.UNCERTAIN
+			reasoning = 'The tool succeeded, but the intended target element cannot be verified.'
+		else:
+			status = ActionCompletionStatus.COMPLETED
+			reasoning = 'The intended action was dispatched successfully to the verified target.'
+
+		action_summary = json.dumps(
+			{
+				'operation_kind': operation.value,
+				'action_names': action_names,
+				'input_values': input_values,
+				'tool_succeeded': tool_succeeded,
+				'target_matched': target_matched,
+				'side_effect_uncertain': side_effect_uncertain,
+				'errors': errors,
+			},
+			ensure_ascii=False,
+		)
+		artifact = self._create_qa_artifact(
+			kind=EvidenceKind.ACTION,
+			summary=action_summary,
+			url=after.url,
+			metadata={'selected_element': selected_element or {}},
+		)
+		related_requests = related_network
+		receipt = ActionReceipt(
+			status=status,
+			operation_kind=operation,
+			tool_succeeded=tool_succeeded,
+			target_matched=target_matched,
+			selected_element=selected_element,
+			input_values=input_values,
+			state_changed=state_changed,
+			side_effect_uncertain=side_effect_uncertain,
+			action_names=action_names,
+			related_request_ids=[str(item.metadata['request_id']) for item in related_requests],
+			evidence_ids=[artifact.evidence_id, *(item.evidence_id for item in related_requests)],
+			reasoning=reasoning,
+		)
+		return receipt, artifact
+
+	async def _build_qa_evidence(self, step: WebUITestStep) -> StepEvidence:
+		assert self._qa_before_snapshot is not None
+		after = await self._capture_qa_snapshot(
+			f'step_{self._qa_current_step_index + 1}_attempt_{self._qa_step_retry_count + 1}_after'
+		)
+		action_results: list[dict[str, Any]] = []
+		action_names: list[str] = []
+		input_values: list[str] = []
+		selected_element: dict[str, Any] | None = None
+		for history_item in self.history.history[self._qa_step_history_start :]:
+			if history_item.model_output is not None:
+				for action in history_item.model_output.action:
+					action_name = self._qa_replay_action_name(action)
+					action_names.append(action_name)
+					if action_name in {'input', 'input_text', 'type'}:
+						action_payload = action.model_dump(exclude_none=True, mode='json').get(action_name, {})
+						if isinstance(action_payload, dict):
+							for key in ('text', 'value'):
+								if key in action_payload:
+									input_values.append(self._redact_qa_text(str(action_payload[key])))
+			for interacted in history_item.state.interacted_element or []:
+				if interacted is not None:
+					selected_element = interacted.to_dict()
+			for result in history_item.result:
+				# ``finish_test_step`` is an executor claim, not objective evidence for the
+				# independent judge. Keep only tool/browser action outcomes here.
+				if result.metadata and 'qa_finish_test_step' in result.metadata:
+					continue
+				raw_result = result.model_dump(exclude_none=True, mode='json', exclude={'images'})
+				action_results.append(json.loads(self._redact_qa_text(json.dumps(raw_result, ensure_ascii=False))))
+
+		finish_metadata: dict[str, Any] = {}
+		if self.history.history and self.history.history[-1].result:
+			finish_metadata = self.history.history[-1].result[-1].metadata or {}
+		finish_report = finish_metadata.get('qa_finish_test_step', {})
+		side_effect_uncertain = bool(finish_report.get('side_effect_uncertain', False))
+		receipt, action_artifact = self._build_action_receipt(
+			step=step,
+			before=self._qa_before_snapshot,
+			after=after,
+			action_results=action_results,
+			action_names=[name for name in action_names if name != self._completion_action_name],
+			selected_element=selected_element,
+			input_values=input_values,
+			side_effect_uncertain=side_effect_uncertain,
+		)
+		quality = EvidenceQuality.WEAK
+		if receipt.status == ActionCompletionStatus.COMPLETED and after.dom_summary.strip():
+			quality = EvidenceQuality.STRONG if receipt.target_matched is True else EvidenceQuality.MEDIUM
+		return StepEvidence(
+			before=self._qa_before_snapshot,
+			after=after,
+			action_results=action_results,
+			action_receipt=receipt,
+			artifacts=[action_artifact],
+			executor_report=self._redact_qa_text(str(finish_report.get('actual_result') or '')) or None,
+			side_effect_uncertain=side_effect_uncertain,
+			evidence_quality=quality,
+		)
+
+	def _qa_mark_boundary_non_terminal(self, memory: str) -> None:
+		"""Turn the executor's step-boundary action into ordinary history before continuing."""
+
+		if self.history.history and self.history.history[-1].result:
+			boundary = self.history.history[-1].result[-1]
+			boundary.is_done = False
+			boundary.success = None
+		self.state.last_result = [ActionResult(long_term_memory=memory)]
+		self.state.consecutive_failures = 0
+
+	@staticmethod
+	def _qa_run_status_for_step(status: QAStepStatus) -> tuple[QARunStatus, FailureOrigin]:
+		mapping = {
+			QAStepStatus.SUT_FAILED: (QARunStatus.SUT_FAILED, FailureOrigin.SUT),
+			QAStepStatus.AGENT_FAILED: (QARunStatus.AGENT_FAILED, FailureOrigin.AGENT),
+			QAStepStatus.BLOCKED: (QARunStatus.BLOCKED, FailureOrigin.ENVIRONMENT),
+			QAStepStatus.INCONCLUSIVE: (QARunStatus.INCONCLUSIVE, FailureOrigin.UNKNOWN),
+		}
+		return mapping[status]
+
+	@staticmethod
+	def _qa_runtime_failure_status(exc: Exception, *, phase: str) -> tuple[QARunStatus, FailureOrigin]:
+		"""Classify framework failures without ever turning them into SUT defects."""
+
+		if isinstance(exc, ModelProviderError):
+			return QARunStatus.AGENT_FAILED, FailureOrigin.AGENT
+		if phase in {'browser_start', 'exploration'} or isinstance(exc, (BrowserError, ConnectionError, OSError)):
+			return QARunStatus.BLOCKED, FailureOrigin.ENVIRONMENT
+		message = f'{type(exc).__name__}: {exc}'.lower()
+		browser_failure_markers = ('browser', 'chromium', 'cdp', 'websocket', 'target closed', 'network connection')
+		if any(marker in message for marker in browser_failure_markers):
+			return QARunStatus.BLOCKED, FailureOrigin.ENVIRONMENT
+		return QARunStatus.AGENT_FAILED, FailureOrigin.AGENT
+
+	@staticmethod
+	def _qa_runtime_failure_code(exc: Exception, *, phase: str) -> FailureCode:
+		"""Attach an auditable subtype without ever classifying framework errors as SUT defects."""
+
+		message = f'{type(exc).__name__}: {exc}'.casefold()
+		if 'captcha' in message:
+			return FailureCode.ENV_CAPTCHA
+		if any(marker in message for marker in ('out of scope', 'navigation policy', 'allowed_domains', 'prohibited_domains')):
+			return FailureCode.ENV_NAVIGATION_POLICY
+		if any(marker in message for marker in ('credential', 'authentication', 'login required', 'sign in')):
+			return FailureCode.ENV_AUTH_REQUIRED
+		if isinstance(exc, ModelProviderError):
+			return FailureCode.AGENT_MODEL_FAILURE
+		if phase == 'specification':
+			return FailureCode.AGENT_COMPILER_ERROR
+		if any(marker in message for marker in ('network', 'dns', 'connection refused', 'timed out')):
+			return FailureCode.ENV_NETWORK
+		if phase in {'browser_start', 'exploration'} or any(
+			marker in message for marker in ('browser', 'chromium', 'cdp', 'websocket', 'target closed')
+		):
+			return FailureCode.ENV_BROWSER
+		return FailureCode.AGENT_ACTION_ERROR
+
+	def _finalize_qa_result(
+		self,
+		*,
+		status: QARunStatus,
+		failure_origin: FailureOrigin | None,
+		summary: str,
+		stopped_at_step: str | None = None,
+		validation_errors: list[str] | None = None,
+		failure_code: FailureCode | None = None,
+	) -> None:
+		if self._qa_test_case is not None:
+			recorded_ids = {result.step.step_id for result in self._qa_step_results}
+			for step in self._qa_test_case.steps:
+				if step.step_id not in recorded_ids:
+					self._qa_step_results.append(QAStepResult(step=step, status=QAStepStatus.NOT_RUN))
+
+		if failure_code is None:
+			for recorded in reversed(self._qa_step_results):
+				if recorded.judgement is not None:
+					failure_code = recorded.judgement.failure_code
+					break
+		failure_code = failure_code or FailureCode.NONE
+		artifacts: list[EvidenceArtifact] = []
+		seen_artifacts: set[str] = set()
+		for recorded in self._qa_step_results:
+			if recorded.evidence is None:
+				continue
+			for artifact in recorded.evidence.artifacts:
+				if artifact.evidence_id not in seen_artifacts:
+					artifacts.append(artifact)
+					seen_artifacts.add(artifact.evidence_id)
+
+		viewport = self.browser_profile.viewport
+		self.history.qa_result = QARunResult(
+			run_id=self._qa_run_id,
+			status=status,
+			failure_origin=failure_origin,
+			failure_code=failure_code,
+			test_case=self._qa_test_case,
+			precondition_results=self._qa_precondition_results,
+			step_results=self._qa_step_results,
+			cleanup_results=self._qa_cleanup_results,
+			stopped_at_step=stopped_at_step,
+			summary=summary,
+			validation_errors=validation_errors or [],
+			warnings=self._qa_warnings,
+			requested_mode=self._qa_requested_mode,
+			effective_mode=self._qa_effective_mode,
+			llm_call_count=self._qa_llm_call_count,
+			environment={
+				'root_url': self._qa_scope.root_url if self._qa_scope else None,
+				'headless': self.browser_profile.headless,
+				'viewport': viewport.model_dump() if viewport is not None and hasattr(viewport, 'model_dump') else viewport,
+			},
+			artifacts=artifacts,
+			phase_timings=[
+				QAPhaseTiming(phase=phase, elapsed_seconds=elapsed) for phase, elapsed in self._qa_phase_timings.items()
+			],
+		)
+		if not self.history.history:
+			self.history.add_item(
+				AgentHistory(
+					model_output=None,
+					result=[ActionResult(is_done=True, success=None, extracted_content=summary, long_term_memory=summary)],
+					state=BrowserStateHistory(
+						url=self._qa_scope.root_url if self._qa_scope else '',
+						title='',
+						tabs=[],
+						interacted_element=[],
+						screenshot_path=None,
+					),
+					metadata=None,
+				)
+			)
+		terminal_success: bool | None = None
+		if status == QARunStatus.PASSED:
+			terminal_success = True
+		elif status == QARunStatus.SUT_FAILED:
+			terminal_success = False
+		if self.history.history and self.history.history[-1].result:
+			terminal = self.history.history[-1].result[-1]
+			terminal.is_done = True
+			terminal.success = terminal_success
+			terminal.extracted_content = summary
+
+	async def _finalize_or_start_qa_cleanup(
+		self,
+		*,
+		status: QARunStatus,
+		failure_origin: FailureOrigin | None,
+		summary: str,
+		stopped_at_step: str | None = None,
+		failure_code: FailureCode | None = None,
+		after: BrowserEvidenceSnapshot,
+	) -> bool:
+		"""Run optional cleanup without allowing it to replace the business verdict."""
+
+		assert self._qa_test_case is not None
+		if not self._qa_test_case.cleanup_steps:
+			self._finalize_qa_result(
+				status=status,
+				failure_origin=failure_origin,
+				failure_code=failure_code,
+				stopped_at_step=stopped_at_step,
+				summary=summary,
+			)
+			return True
+
+		self._qa_pending_business_outcome = {
+			'status': status,
+			'failure_origin': failure_origin,
+			'failure_code': failure_code,
+			'stopped_at_step': stopped_at_step,
+			'summary': summary,
+		}
+		self._qa_running_cleanup = True
+		self._qa_cleanup_index = 0
+		self._qa_step_retry_count = 0
+		self._qa_mark_boundary_non_terminal('Business verdict recorded; starting isolated cleanup.')
+		self._qa_before_snapshot = after
+		self._qa_evidence_cursor = self._qa_evidence_monitor.cursor() if self._qa_evidence_monitor else None
+		self._qa_step_history_start = len(self.history.history)
+		self._message_manager.add_new_task(self._qa_step_prompt(self._qa_test_case.cleanup_steps[0]))
+		return False
+
+	def _finalize_pending_business_outcome(self) -> None:
+		"""Publish the stored business verdict after cleanup completes or fails."""
+
+		if self._qa_pending_business_outcome is None:
+			raise RuntimeError('No pending QA business outcome exists')
+		outcome = self._qa_pending_business_outcome
+		self._qa_pending_business_outcome = None
+		self._qa_running_cleanup = False
+		self._finalize_qa_result(**outcome)
+
+	def _abort_qa_cleanup(self, reason: str) -> None:
+		"""Record cleanup infrastructure failure while preserving the business outcome."""
+
+		if not self._qa_running_cleanup or self._qa_pending_business_outcome is None:
+			return
+		assert self._qa_test_case is not None
+		if self._qa_cleanup_index < len(self._qa_test_case.cleanup_steps):
+			step = self._qa_test_case.cleanup_steps[self._qa_cleanup_index]
+			self._qa_cleanup_results.append(QACleanupResult(step=step, status=QAStepStatus.AGENT_FAILED, reason=reason))
+		self._qa_warnings.append(f'Cleanup aborted: {reason}')
+		self._finalize_pending_business_outcome()
+
+	async def _handle_qa_step_boundary(self) -> bool:
+		"""Judge a submitted step. Return True only when the complete QA run is terminal."""
+
+		assert self._qa_test_case is not None
+		step = (
+			self._qa_precondition_step
+			if self._qa_running_preconditions and self._qa_precondition_step is not None
+			else (
+				self._qa_test_case.cleanup_steps[self._qa_cleanup_index]
+				if self._qa_running_cleanup
+				else self._qa_test_case.steps[self._qa_current_step_index]
+			)
+		)
+		evidence = await self._build_qa_evidence(step)
+		if evidence.action_receipt is not None:
+			self._qa_current_attempt_receipts.append(evidence.action_receipt)
+		review: ReviewRecord | None = None
+		try:
+			self._qa_llm_call_count += 1
+			judgement = await judge_test_step(
+				llm=self.judge_llm,
+				step=step,
+				evidence=evidence,
+				action_receipt=evidence.action_receipt,
+			)
+		except Exception as exc:
+			self.logger.error(f'Independent QA step judge failed: {exc}', exc_info=True)
+			judgement = StepJudgement(
+				action_status=ActionCompletionStatus.UNCERTAIN,
+				expectation_status=ExpectationStatus.NOT_OBSERVABLE,
+				status=QAStepStatus.AGENT_FAILED,
+				failure_origin=FailureOrigin.AGENT,
+				failure_code=FailureCode.AGENT_JUDGE_ERROR,
+				reasoning=f'Independent judge failed: {type(exc).__name__}: {exc}',
+				actual_result='No reliable judgement was produced.',
+				evidence=[],
+				retry_safe=False,
+			)
+
+		review_required = (
+			not self._qa_running_preconditions
+			and not self._qa_running_cleanup
+			and (
+				judgement.status == QAStepStatus.SUT_FAILED
+				or (judgement.status == QAStepStatus.PASSED and judgement.confidence < 0.8)
+			)
+		)
+		if review_required:
+			review = ReviewRecord(
+				primary_status=judgement.status,
+				reviewer_model=getattr(self.review_llm, 'model', None),
+				evidence_ids=judgement.evidence_ids,
+			)
+			try:
+				self._qa_llm_call_count += 1
+				secondary = await judge_test_step(
+					llm=self.review_llm,
+					step=step,
+					evidence=evidence,
+					action_receipt=evidence.action_receipt,
+				)
+				review.secondary_status = secondary.status
+				review.agreed = secondary.status == judgement.status
+				review.reason = secondary.reasoning
+				if not review.agreed:
+					judgement = StepJudgement(
+						action_status=evidence.action_receipt.status
+						if evidence.action_receipt
+						else ActionCompletionStatus.UNCERTAIN,
+						expectation_status=ExpectationStatus.NOT_OBSERVABLE,
+						status=QAStepStatus.INCONCLUSIVE,
+						failure_origin=FailureOrigin.UNKNOWN,
+						failure_code=FailureCode.UNKNOWN_CONFLICT,
+						reasoning=(
+							f'Independent risk review disagreed with the primary verdict: '
+							f'{review.primary_status.value} vs {secondary.status.value}.'
+						),
+						actual_result='Independent Judges did not agree on a reliable product verdict.',
+						evidence_ids=sorted(set(judgement.evidence_ids + secondary.evidence_ids)),
+						confidence=min(judgement.confidence, secondary.confidence, 0.49),
+					)
+			except Exception as exc:
+				review.reason = f'Review Judge failed: {type(exc).__name__}: {exc}'
+				judgement = StepJudgement(
+					action_status=evidence.action_receipt.status if evidence.action_receipt else ActionCompletionStatus.UNCERTAIN,
+					expectation_status=ExpectationStatus.NOT_OBSERVABLE,
+					status=QAStepStatus.AGENT_FAILED,
+					failure_origin=FailureOrigin.AGENT,
+					failure_code=FailureCode.AGENT_JUDGE_ERROR,
+					reasoning=review.reason,
+					actual_result='Required independent SUT review was not produced.',
+					evidence_ids=judgement.evidence_ids,
+				)
+
+		if (
+			judgement.status == QAStepStatus.AGENT_FAILED
+			and judgement.retry_safe
+			and not evidence.side_effect_uncertain
+			and self._qa_step_retry_count < self.settings.max_agent_retries_per_step
+		):
+			self._qa_step_retry_count += 1
+			self._qa_mark_boundary_non_terminal(
+				f'Independent judge requested safe agent recovery attempt {self._qa_step_retry_count}: {judgement.reasoning}'
+			)
+			self._qa_before_snapshot = evidence.after
+			self._qa_evidence_cursor = self._qa_evidence_monitor.cursor() if self._qa_evidence_monitor else None
+			self._qa_step_history_start = len(self.history.history)
+			self._message_manager.add_new_task(self._qa_step_prompt(step, retry_reason=judgement.reasoning))
+			return False
+
+		if self._qa_running_cleanup:
+			self._qa_cleanup_results.append(
+				QACleanupResult(
+					step=step,
+					status=judgement.status,
+					reason=judgement.actual_result,
+					evidence_ids=judgement.evidence_ids,
+				)
+			)
+			if judgement.status != QAStepStatus.PASSED:
+				self._qa_warnings.append(f'Cleanup {step.step_id} ended as {judgement.status.value}: {judgement.actual_result}')
+			self._qa_cleanup_index += 1
+			if self._qa_cleanup_index < len(self._qa_test_case.cleanup_steps):
+				self._qa_mark_boundary_non_terminal(f'Cleanup {step.step_id} recorded; continuing cleanup.')
+				self._qa_step_retry_count = 0
+				self._qa_before_snapshot = evidence.after
+				self._qa_evidence_cursor = self._qa_evidence_monitor.cursor() if self._qa_evidence_monitor else None
+				self._qa_step_history_start = len(self.history.history)
+				self._message_manager.add_new_task(self._qa_step_prompt(self._qa_test_case.cleanup_steps[self._qa_cleanup_index]))
+				return False
+			self._finalize_pending_business_outcome()
+			return True
+
+		if self._qa_running_preconditions:
+			if judgement.status == QAStepStatus.PASSED:
+				self._qa_precondition_results = [
+					QAPreconditionResult(
+						precondition=item,
+						status=(
+							PreconditionStatus.ENSURED if item.mode == PreconditionMode.ENSURE else PreconditionStatus.SATISFIED
+						),
+						reason=judgement.actual_result,
+						evidence_ids=judgement.evidence_ids,
+					)
+					for item in self._qa_test_case.preconditions
+				]
+				self._qa_mark_boundary_non_terminal('All required QA preconditions were satisfied.')
+				self._qa_running_preconditions = False
+				self._qa_precondition_step = None
+				self._qa_phase = 'execution'
+				self._qa_step_retry_count = 0
+				self._qa_current_attempt_receipts = []
+				self._qa_before_snapshot = evidence.after
+				self._qa_evidence_cursor = self._qa_evidence_monitor.cursor() if self._qa_evidence_monitor else None
+				self._qa_step_history_start = len(self.history.history)
+				self._message_manager.add_new_task(self._qa_step_prompt(self._qa_test_case.steps[0]))
+				return False
+
+			self._qa_precondition_results = [
+				QAPreconditionResult(
+					precondition=item,
+					status=PreconditionStatus.BLOCKED,
+					reason=judgement.actual_result,
+					evidence_ids=judgement.evidence_ids,
+				)
+				for item in self._qa_test_case.preconditions
+			]
+			if judgement.status == QAStepStatus.AGENT_FAILED:
+				status = QARunStatus.AGENT_FAILED
+				origin = FailureOrigin.AGENT
+				code = judgement.failure_code
+			elif judgement.status == QAStepStatus.INCONCLUSIVE:
+				status = QARunStatus.INCONCLUSIVE
+				origin = FailureOrigin.UNKNOWN
+				code = judgement.failure_code
+			else:
+				status = QARunStatus.BLOCKED
+				origin = FailureOrigin.ENVIRONMENT
+				code = FailureCode.ENV_TEST_DATA
+			self._finalize_qa_result(
+				status=status,
+				failure_origin=origin,
+				failure_code=code,
+				summary=f'{status.value} during QA preconditions: {judgement.actual_result}',
+			)
+			return True
+
+		step_result = QAStepResult(
+			step=step,
+			status=judgement.status,
+			retry_count=self._qa_step_retry_count,
+			judgement=judgement,
+			review=review,
+			evidence=evidence,
+			attempt_receipts=[receipt.model_copy(deep=True) for receipt in self._qa_current_attempt_receipts],
+		)
+		self._qa_step_results.append(step_result)
+		if judgement.status == QAStepStatus.PASSED and judgement.replay_assertions:
+			self._qa_replay_history[step.step_id] = [
+				item.model_copy(deep=True) for item in self.history.history[self._qa_step_history_start :]
+			]
+		if judgement.status == QAStepStatus.PASSED and self._qa_replay_fallback_active:
+			self._qa_mark_boundary_non_terminal(f'QA replay fallback repaired {step.step_id}.')
+			self._qa_replay_fallback_active = False
+			self._qa_replay_fallback_completed = True
+			return True
+
+		if judgement.status != QAStepStatus.PASSED:
+			run_status, failure_origin = self._qa_run_status_for_step(judgement.status)
+			return await self._finalize_or_start_qa_cleanup(
+				status=run_status,
+				failure_origin=failure_origin,
+				stopped_at_step=step.step_id,
+				summary=f'{run_status.value} at {step.step_id}: {judgement.actual_result}',
+				after=evidence.after,
+			)
+
+		self._qa_current_step_index += 1
+		if self._qa_current_step_index >= len(self._qa_test_case.steps):
+			return await self._finalize_or_start_qa_cleanup(
+				status=QARunStatus.PASSED,
+				failure_origin=FailureOrigin.NONE,
+				summary=f'PASSED: all {len(self._qa_test_case.steps)} business-step expectations were met.',
+				after=evidence.after,
+			)
+
+		self._qa_mark_boundary_non_terminal(f'QA step {step.step_id} passed independent judgement.')
+		self._qa_step_retry_count = 0
+		self._qa_current_attempt_receipts = []
+		self._qa_before_snapshot = evidence.after
+		self._qa_evidence_cursor = self._qa_evidence_monitor.cursor() if self._qa_evidence_monitor else None
+		self._qa_step_history_start = len(self.history.history)
+		next_step = self._qa_test_case.steps[self._qa_current_step_index]
+		self._message_manager.add_new_task(self._qa_step_prompt(next_step))
+		return False
+
+	async def _notify_qa_done_callback(self) -> None:
+		"""Invoke the public done callback exactly once for every terminal QA run."""
+
+		if self._qa_done_callback_called or self.register_done_callback is None:
+			return
+		self._qa_done_callback_called = True
+		if inspect.iscoroutinefunction(self.register_done_callback):
+			await self.register_done_callback(self.history)
+		else:
+			self.register_done_callback(self.history)
 
 	@observe(name='agent.run', ignore_input=True, ignore_output=True)
 	@time_execution_async('--run')
@@ -2509,7 +4709,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		on_step_start: AgentHookFunc | None = None,
 		on_step_end: AgentHookFunc | None = None,
 	) -> AgentHistoryList[AgentStructuredOutput]:
-		"""Execute the task with maximum number of steps"""
+		"""Compile and execute a Web UI QA case with independent per-step judgement."""
 
 		loop = asyncio.get_event_loop()
 		agent_run_error: str | None = None  # Initialize error tracking variable
@@ -2540,13 +4740,68 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		try:
 			await self._log_agent_run()
 
+			# Initialize timing before specification validation because final task
+			# events are emitted for INVALID_SPEC runs as well.
+			self._session_start_time = time.time()
+			self._task_start_time = self._session_start_time
+
+			if self._qa_scope_error:
+				self._finalize_qa_result(
+					status=QARunStatus.INVALID_SPEC,
+					failure_origin=None,
+					summary=f'INVALID_SPEC: {self._qa_scope_error}',
+					validation_errors=[self._qa_scope_error],
+				)
+				self.history.usage = await self.token_cost_service.get_usage_summary()
+				await self._notify_qa_done_callback()
+				return self.history
+
+			reuse_cached_case = bool(
+				self.settings.reuse_compiled_test_case
+				and self._qa_test_case is not None
+				and self._qa_compiled_task is not None
+				and self._qa_original_task.strip() == self._qa_compiled_task.strip()
+			)
+			if reuse_cached_case:
+				self._qa_test_case_draft = None
+				self.logger.info('♻️ Skipping Task compilation and discovery LLM calls for this repeated QA run.')
+			else:
+				# Stage 1 is browser-independent. A malformed/uncompilable specification
+				# must not launch Chromium or mutate any page state.
+				try:
+					compiler = QATaskCompiler(self.judge_llm)
+					try:
+						self._qa_test_case_draft = await compiler.extract_requirements(
+							task=self._qa_original_task,
+							ground_truth=self.settings.ground_truth,
+						)
+					finally:
+						self._qa_llm_call_count += compiler.call_count
+				except (ValidationError, ValueError) as exc:
+					self._finalize_qa_result(
+						status=QARunStatus.INVALID_SPEC,
+						failure_origin=None,
+						summary=f'INVALID_SPEC: test structure could not be generated: {type(exc).__name__}: {exc}',
+						validation_errors=[str(exc)],
+					)
+					self.history.usage = await self.token_cost_service.get_usage_summary()
+					await self._notify_qa_done_callback()
+					return self.history
+				except Exception as exc:
+					status, origin = self._qa_runtime_failure_status(exc, phase='specification')
+					self._finalize_qa_result(
+						status=status,
+						failure_origin=origin,
+						failure_code=self._qa_runtime_failure_code(exc, phase='specification'),
+						summary=f'{status.value} during QA specification compilation: {type(exc).__name__}: {exc}',
+					)
+					self.history.usage = await self.token_cost_service.get_usage_summary()
+					await self._notify_qa_done_callback()
+					return self.history
+
 			self.logger.debug(
 				f'🔧 Agent setup: Agent Session ID {self.session_id[-4:]}, Task ID {self.task_id[-4:]}, Browser Session ID {self.browser_session.id[-4:] if self.browser_session else "None"} {"(connecting via CDP)" if (self.browser_session and self.browser_session.cdp_url) else "(launching local browser)"}'
 			)
-
-			# Initialize timing for session and task
-			self._session_start_time = time.time()
-			self._task_start_time = self._session_start_time  # Initialize task start time
 
 			# Only dispatch session events if this is the first run
 			if not self.state.session_initialized:
@@ -2563,7 +4818,12 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			# Log startup message on first step (only if we haven't already done steps)
 			self._log_first_step_startup()
 			# Start browser session and attach watchdogs
+			self._qa_phase = 'browser_start'
+			self._ensure_browser_session_can_restart()
 			await self.browser_session.start()
+			await self._restore_cached_qa_login_state()
+			self._qa_evidence_monitor = QAEvidenceMonitor(self.browser_session, self._qa_scope)
+			await self._qa_evidence_monitor.start()
 			if self._demo_mode_enabled:
 				await self._demo_mode_log(f'Started task: {self.task}', 'info', {'tag': 'task'})
 				await self._demo_mode_log(
@@ -2597,6 +4857,49 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			except Exception as e:
 				raise e
 
+			try:
+				if reuse_cached_case:
+					await self._prepare_reused_qa_case()
+				else:
+					assert self._qa_test_case_draft is not None
+					await self._prepare_qa_case(self._qa_test_case_draft)
+				if self.history.qa_result is not None:
+					self.history.usage = await self.token_cost_service.get_usage_summary()
+					await self._notify_qa_done_callback()
+					return self.history
+			except QAExplorationStateError as exc:
+				status = QARunStatus.INCONCLUSIVE if exc.inconclusive else QARunStatus.BLOCKED
+				origin = FailureOrigin.UNKNOWN if exc.inconclusive else FailureOrigin.ENVIRONMENT
+				self._finalize_qa_result(
+					status=status,
+					failure_origin=origin,
+					summary=f'{status.value} during QA exploration restoration: {exc}',
+				)
+				self.history.usage = await self.token_cost_service.get_usage_summary()
+				await self._notify_qa_done_callback()
+				return self.history
+			except (ValidationError, ValueError) as exc:
+				self._finalize_qa_result(
+					status=QARunStatus.INVALID_SPEC,
+					failure_origin=None,
+					summary=f'INVALID_SPEC: {exc}',
+					validation_errors=[str(exc)],
+				)
+				self.history.usage = await self.token_cost_service.get_usage_summary()
+				await self._notify_qa_done_callback()
+				return self.history
+			except Exception as exc:
+				status, origin = self._qa_runtime_failure_status(exc, phase=self._qa_phase)
+				self._finalize_qa_result(
+					status=status,
+					failure_origin=origin,
+					failure_code=self._qa_runtime_failure_code(exc, phase=self._qa_phase),
+					summary=f'{status.value} during QA discovery/compilation: {type(exc).__name__}: {exc}',
+				)
+				self.history.usage = await self.token_cost_service.get_usage_summary()
+				await self._notify_qa_done_callback()
+				return self.history
+
 			self.logger.debug(
 				f'🔄 Starting main execution loop with max {max_steps} steps (currently at step {self.state.n_steps})...'
 			)
@@ -2627,10 +4930,15 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				is_done = await self._execute_step(current_step, max_steps, step_info, on_step_start, on_step_end)
 
 				if is_done:
-					# Agent has marked the task as done
+					qa_terminal = await self._handle_qa_step_boundary()
+					if not qa_terminal:
+						continue
+
+					# The independent judge has produced a terminal case result.
 					if self._demo_mode_enabled and self.history.history:
-						final_result_text = self.history.final_result() or 'Task completed'
+						final_result_text = self.history.final_result() or 'QA run completed'
 						await self._demo_mode_log(f'Final Result: {final_result_text}', 'success', {'tag': 'task'})
+					await self._notify_qa_done_callback()
 
 					should_delay_close = True
 					break
@@ -2654,12 +4962,30 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 				self.logger.info(f'❌ {agent_run_error}')
 
+			if self.history.qa_result is None:
+				if self._qa_pending_business_outcome is not None:
+					self._abort_qa_cleanup(agent_run_error or 'Cleanup execution ended without a result')
+				else:
+					status = QARunStatus.BLOCKED if self.state.stopped else QARunStatus.AGENT_FAILED
+					origin = FailureOrigin.ENVIRONMENT if status == QARunStatus.BLOCKED else FailureOrigin.AGENT
+					self._finalize_qa_result(
+						status=status,
+						failure_origin=origin,
+						summary=f'{status.value}: {agent_run_error or "execution ended without a QA verdict"}',
+						stopped_at_step=(
+							self._qa_test_case.steps[self._qa_current_step_index].step_id
+							if self._qa_test_case and self._qa_current_step_index < len(self._qa_test_case.steps)
+							else None
+						),
+					)
+
 			self.history.usage = await self.token_cost_service.get_usage_summary()
 
 			# set the model output schema and call it on the fly
 			if self.history._output_model_schema is None and self.output_model_schema is not None:
 				self.history._output_model_schema = self.output_model_schema
 
+			await self._notify_qa_done_callback()
 			return self.history
 
 		except KeyboardInterrupt:
@@ -2667,14 +4993,48 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.logger.debug('Got KeyboardInterrupt during execution, returning current history')
 			agent_run_error = 'KeyboardInterrupt'
 
+			if self.history.qa_result is None:
+				if self._qa_pending_business_outcome is not None:
+					self._abort_qa_cleanup('Cleanup interrupted by the operator')
+				else:
+					self._finalize_qa_result(
+						status=QARunStatus.BLOCKED,
+						failure_origin=FailureOrigin.ENVIRONMENT,
+						summary='BLOCKED: execution interrupted by the operator',
+						stopped_at_step=(
+							self._qa_test_case.steps[self._qa_current_step_index].step_id
+							if self._qa_test_case and self._qa_current_step_index < len(self._qa_test_case.steps)
+							else None
+						),
+					)
+
 			self.history.usage = await self.token_cost_service.get_usage_summary()
 
+			await self._notify_qa_done_callback()
 			return self.history
 
 		except Exception as e:
 			self.logger.error(f'Agent run failed with exception: {e}', exc_info=True)
 			agent_run_error = str(e)
-			raise e
+			if self.history.qa_result is None:
+				if self._qa_pending_business_outcome is not None:
+					self._abort_qa_cleanup(f'{type(e).__name__}: {e}')
+				else:
+					status, origin = self._qa_runtime_failure_status(e, phase=self._qa_phase)
+					self._finalize_qa_result(
+						status=status,
+						failure_origin=origin,
+						failure_code=self._qa_runtime_failure_code(e, phase=self._qa_phase),
+						summary=f'{status.value}: {type(e).__name__}: {e}',
+						stopped_at_step=(
+							self._qa_test_case.steps[self._qa_current_step_index].step_id
+							if self._qa_test_case and self._qa_current_step_index < len(self._qa_test_case.steps)
+							else None
+						),
+					)
+			self.history.usage = await self.token_cost_service.get_usage_summary()
+			await self._notify_qa_done_callback()
+			return self.history
 
 		finally:
 			if should_delay_close and self._demo_mode_enabled and agent_run_error is None:
@@ -2702,6 +5062,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 			# Emit UpdateAgentTaskEvent at the END of run() with final task state
 			self.eventbus.dispatch(UpdateAgentTaskEvent.from_agent(self))
+			await self._cache_qa_login_state()
 
 			# Generate GIF if needed before stopping event bus
 			if self.settings.generate_gif:
@@ -2761,9 +5122,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			action_name = next(iter(action_data.keys())) if action_data else 'unknown'
 
 			if i > 0:
-				# ONLY ALLOW TO CALL `done` IF IT IS A SINGLE ACTION
-				if action_data.get('done') is not None:
-					msg = f'Done action is allowed only as a single action - stopped after action {i} / {total_actions}.'
+				# The QA completion action must always be emitted alone.
+				if action_data.get(self._completion_action_name) is not None:
+					msg = f'finish_test_step is allowed only as a single action - stopped after action {i} / {total_actions}.'
 					self.logger.debug(msg)
 					break
 
@@ -3127,9 +5488,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		                max_step_interval: Maximum delay from saved step_interval (caps LLM time from original run)
 		                summary_llm: Optional LLM to use for generating the final summary. If not provided, uses the agent's LLM
 		                ai_step_llm: Optional LLM to use for AI steps (extract actions). If not provided, uses the agent's LLM
-		                wait_for_elements: If True, wait for minimum number of elements before attempting element
-		                               matching. Useful for SPA pages where shadow DOM content loads dynamically.
-		                               Default is False.
+		                wait_for_elements: If True, wait until the saved target elements are matchable before
+		                               replaying the step. Useful for SPA pages where shadow DOM content loads
+		                               dynamically. Default is False.
 
 		Returns:
 		                List of action results (including AI summary as the final result)
@@ -3333,6 +5694,139 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.logger.debug('📝 Saved initial actions to history as step 0')
 			self.logger.debug('Initial actions completed')
 
+	@staticmethod
+	def _historical_element_is_present(
+		historical_element: DOMInteractedElement,
+		browser_state_summary: BrowserStateSummary,
+	) -> bool:
+		"""Return whether a saved element can be matched in the current DOM state."""
+
+		selector_map = browser_state_summary.dom_state.selector_map or {}
+		selector_items = list(selector_map.items())
+		if historical_element.frame_id:
+			same_frame_items = [
+				(index, element) for index, element in selector_items if element.frame_id == historical_element.frame_id
+			]
+			if same_frame_items:
+				selector_items = same_frame_items + [
+					(index, element) for index, element in selector_items if element.frame_id != historical_element.frame_id
+				]
+
+		if any(element.element_hash == historical_element.element_hash for _, element in selector_items):
+			return True
+		if historical_element.stable_hash is not None and any(
+			element.compute_stable_hash() == historical_element.stable_hash for _, element in selector_items
+		):
+			return True
+		if historical_element.x_path and any(element.xpath == historical_element.x_path for _, element in selector_items):
+			return True
+		if historical_element.ax_name:
+			node_name = historical_element.node_name.lower()
+			if any(
+				element.node_name.lower() == node_name
+				and element.ax_node is not None
+				and element.ax_node.name == historical_element.ax_name
+				for _, element in selector_items
+			):
+				return True
+		if historical_element.attributes:
+			node_name = historical_element.node_name.lower()
+			for attribute in ('name', 'id', 'aria-label'):
+				value = historical_element.attributes.get(attribute)
+				if value and any(
+					element.node_name.lower() == node_name and element.attributes and element.attributes.get(attribute) == value
+					for _, element in selector_items
+				):
+					return True
+		return False
+
+	def _history_targets_present(
+		self,
+		history_item: AgentHistory,
+		browser_state_summary: BrowserStateSummary,
+	) -> bool:
+		"""Check every saved interactive target instead of relying on old indices."""
+
+		if history_item.model_output is None:
+			return True
+		for index, action in enumerate(history_item.model_output.action):
+			action_name = self._qa_replay_action_name(action)
+			if action_name not in {'click', 'input', 'hover', 'select_option', 'drag_and_drop'}:
+				continue
+			historical_element = (
+				history_item.state.interacted_element[index] if index < len(history_item.state.interacted_element) else None
+			)
+			if historical_element is not None and not self._historical_element_is_present(
+				historical_element, browser_state_summary
+			):
+				return False
+		return True
+
+	@staticmethod
+	def _qa_replay_page_key(url: str) -> tuple[str, str, int | None, str] | None:
+		"""Return a conservative page identity for comparing saved and current states."""
+
+		if not url:
+			return None
+		parsed = urlparse(url)
+		if not parsed.scheme or not parsed.hostname:
+			return None
+		path = parsed.path.rstrip('/') or '/'
+		return parsed.scheme.lower(), parsed.hostname.lower(), parsed.port, path
+
+	def _qa_replay_authentication_batch_is_obsolete(
+		self,
+		history_item: AgentHistory,
+		browser_state_summary: BrowserStateSummary,
+	) -> bool:
+		"""Return whether restored login state has already completed this saved auth batch."""
+
+		if not self.settings.reuse_login_state or not self._qa_login_storage_state:
+			return False
+		historical_page = self._qa_replay_page_key(history_item.state.url)
+		current_page = self._qa_replay_page_key(browser_state_summary.url)
+		if historical_page is None or current_page is None or historical_page == current_page:
+			return False
+
+		historical_path = historical_page[3].lower()
+		if any(marker in historical_path for marker in ('/login', '/sign-in', '/signin', '/authentication')):
+			return True
+
+		for element in history_item.state.interacted_element:
+			attributes = element.attributes if element is not None and element.attributes else {}
+			field_type = attributes.get('type', '').lower()
+			autocomplete = attributes.get('autocomplete', '').lower()
+			if field_type == 'password' or autocomplete in {'username', 'current-password'}:
+				return True
+		return False
+
+	async def _wait_for_history_targets(
+		self,
+		history_item: AgentHistory,
+		*,
+		timeout: float = 15.0,
+		poll_interval: float = 0.5,
+		initial_state: BrowserStateSummary | None = None,
+	) -> BrowserStateSummary:
+		"""Wait only until the saved target elements are objectively matchable."""
+
+		started_at = time.perf_counter()
+		last_state = initial_state
+		while True:
+			if last_state is None:
+				last_state = await self.browser_session.get_browser_state_summary(include_screenshot=False)
+			if self._history_targets_present(history_item, last_state):
+				return last_state
+			remaining = timeout - (time.perf_counter() - started_at)
+			if remaining <= 0:
+				break
+			await asyncio.sleep(min(poll_interval, remaining))
+			last_state = None
+
+		self.logger.warning(f'⚠️ Timeout waiting {timeout:.1f}s for saved replay targets; attempting final match')
+		assert last_state is not None
+		return last_state
+
 	async def _wait_for_minimum_elements(
 		self,
 		min_elements: int,
@@ -3404,6 +5898,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		delay: float,
 		ai_step_llm: BaseChatModel | None = None,
 		wait_for_elements: bool = False,
+		browser_state_summary: BrowserStateSummary | None = None,
 	) -> list[ActionResult]:
 		"""Execute a single step from history with element validation.
 
@@ -3413,14 +5908,17 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			history_item: The history step to execute
 			delay: Delay before executing the step
 			ai_step_llm: Optional LLM to use for AI steps
-			wait_for_elements: If True, wait for minimum elements before element matching
+			wait_for_elements: If True, wait until saved target elements are matchable
+			browser_state_summary: Optional already-captured state to reuse for element matching
 		"""
 		assert self.browser_session is not None, 'BrowserSession is not set up'
 
 		await asyncio.sleep(delay)
 
-		# Optionally wait for minimum elements before element matching (useful for SPAs)
-		if wait_for_elements:
+		if browser_state_summary is not None:
+			state = browser_state_summary
+		# Optionally wait for the saved target instead of an unrelated element count.
+		elif wait_for_elements:
 			# Determine if we need to wait for elements (actions that interact with DOM elements)
 			needs_element_matching = False
 			if history_item.model_output:
@@ -3436,13 +5934,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 							needs_element_matching = True
 							break
 
-			# If we need element matching, wait for minimum elements before proceeding
+			# If we need element matching, proceed as soon as every saved target is matchable.
 			if needs_element_matching:
-				min_elements = self._count_expected_elements_from_history(history_item)
-				if min_elements > 0:
-					state = await self._wait_for_minimum_elements(min_elements, timeout=15.0, poll_interval=1.0)
-				else:
-					state = await self.browser_session.get_browser_state_summary(include_screenshot=False)
+				state = await self._wait_for_history_targets(history_item, timeout=15.0, poll_interval=0.5)
 			else:
 				state = await self.browser_session.get_browser_state_summary(include_screenshot=False)
 		else:
@@ -4036,8 +6530,10 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		else:
 			self.AgentOutput = AgentOutput.type_with_custom_actions_no_thinking(self.ActionModel)
 
-		# Update done action model too
-		self.DoneActionModel = self.tools.registry.create_action_model(include_actions=['done'], page_url=page_url)
+		# Update QA completion action model too.
+		self.DoneActionModel = self.tools.registry.create_action_model(
+			include_actions=[self._completion_action_name], page_url=page_url
+		)
 		if self.settings.flash_mode:
 			self.DoneAgentOutput = AgentOutput.type_with_custom_actions_flash_mode(self.DoneActionModel)
 		elif self.settings.use_thinking:

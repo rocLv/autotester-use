@@ -25,6 +25,7 @@ from browser_use.dom.views import DEFAULT_INCLUDE_ATTRIBUTES, DOMInteractedEleme
 # from browser_use.dom.views import SelectorMap
 from browser_use.filesystem.file_system import FileSystemState
 from browser_use.llm.base import BaseChatModel
+from browser_use.qa.views import QARunResult, QARunStatus
 from browser_use.tokens.views import UsageSummary
 from browser_use.tools.registry.views import ActionModel
 from browser_use.utils import collect_sensitive_data_values, redact_sensitive_string
@@ -90,6 +91,9 @@ class AgentSettings(BaseModel):
 	loop_detection_window: int = 20  # Rolling window size for action similarity tracking
 	loop_detection_enabled: bool = True  # Whether to enable loop detection nudges
 	max_clickable_elements_length: int = 40000  # Max characters for clickable elements in prompt
+	max_agent_retries_per_step: int = Field(default=3, ge=0, le=3)
+	reuse_compiled_test_case: bool = True
+	reuse_login_state: bool = True
 
 
 class PageFingerprint(BaseModel):
@@ -597,6 +601,7 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
 
 	history: list[AgentHistory]
 	usage: UsageSummary | None = None
+	qa_result: QARunResult | None = None
 
 	_output_model_schema: type[AgentStructuredOutput] | None = None
 
@@ -668,12 +673,21 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
 
 	def model_dump(self, **kwargs) -> dict[str, Any]:
 		"""Custom serialization that properly uses AgentHistory's model_dump"""
-		return {
+		data: dict[str, Any] = {
 			'history': [h.model_dump(**kwargs) for h in self.history],
 		}
+		if self.qa_result is not None:
+			data['qa_result'] = self.qa_result.model_dump(mode='json')
+		return data
 
 	@classmethod
 	def load_from_dict(cls, data: dict[str, Any], output_model: type[AgentOutput]) -> AgentHistoryList:
+		qa_result = data.get('qa_result')
+		if isinstance(qa_result, dict) and 'schema_version' not in qa_result:
+			# V1 histories remain readable for display and audit, but are explicitly
+			# marked so they cannot silently become trusted QA v2 replay baselines.
+			qa_result['schema_version'] = 2
+			qa_result['legacy_imported'] = True
 		# loop through history and validate output_model actions to enrich with custom actions
 		for h in data.get('history', []):
 			# Use .get() to avoid KeyError on incomplete or legacy history entries
@@ -724,13 +738,25 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
 
 	def is_done(self) -> bool:
 		"""Check if the agent is done"""
+		if self.qa_result is not None:
+			return True
 		if self.history and len(self.history[-1].result) > 0:
 			last_result = self.history[-1].result[-1]
 			return last_result.is_done is True
 		return False
 
 	def is_successful(self) -> bool | None:
-		"""Check if the agent completed successfully - the agent decides in the last step if it was successful or not. None if not done yet."""
+		"""Return a reliable product verdict without conflating execution failures.
+
+		For QA runs, True means all expectations passed and False means the SUT
+		failed a reliable assertion. Agent/environment/unknown failures return None.
+		"""
+		if self.qa_result is not None:
+			if self.qa_result.status == QARunStatus.PASSED:
+				return True
+			if self.qa_result.status == QARunStatus.SUT_FAILED:
+				return False
+			return None
 		if self.history and len(self.history[-1].result) > 0:
 			last_result = self.history[-1].result[-1]
 			if last_result.is_done is True:
@@ -743,6 +769,11 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
 
 	def judgement(self) -> dict | None:
 		"""Get the judgement result as a dictionary if it exists"""
+		if self.qa_result is not None:
+			for step_result in reversed(self.qa_result.step_results):
+				if step_result.judgement is not None:
+					return step_result.judgement.model_dump(mode='json')
+			return None
 		if self.history and len(self.history[-1].result) > 0:
 			last_result = self.history[-1].result[-1]
 			if last_result.judgement:
@@ -751,6 +782,8 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
 
 	def is_judged(self) -> bool:
 		"""Check if the agent trace has been judged"""
+		if self.qa_result is not None:
+			return any(step_result.judgement is not None for step_result in self.qa_result.step_results)
 		if self.history and len(self.history[-1].result) > 0:
 			last_result = self.history[-1].result[-1]
 			return last_result.judgement is not None
@@ -758,6 +791,12 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
 
 	def is_validated(self) -> bool | None:
 		"""Check if the judge validated the agent execution (verdict is True). Returns None if not judged yet."""
+		if self.qa_result is not None:
+			if self.qa_result.status == QARunStatus.PASSED:
+				return True
+			if self.qa_result.status == QARunStatus.SUT_FAILED:
+				return False
+			return None
 		if self.history and len(self.history[-1].result) > 0:
 			last_result = self.history[-1].result[-1]
 			if last_result.judgement:

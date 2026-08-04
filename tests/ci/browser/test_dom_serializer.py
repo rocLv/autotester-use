@@ -14,10 +14,8 @@ Usage:
 import pytest
 from pytest_httpserver import HTTPServer
 
-from browser_use.agent.service import Agent
 from browser_use.browser import BrowserSession
 from browser_use.browser.profile import BrowserProfile, ViewportSize
-from tests.ci.conftest import create_mock_llm
 
 
 @pytest.fixture(scope='session')
@@ -266,50 +264,7 @@ class TestDOMSerializer:
 
 	async def test_dom_serializer_element_counts_detailed(self, browser_session, base_url):
 		"""Detailed test to verify specific element types are captured correctly."""
-
-		actions = [
-			f"""
-			{{
-				"thinking": "Navigating to test page",
-				"evaluation_previous_goal": "Starting",
-				"memory": "Navigate",
-				"next_goal": "Navigate",
-				"action": [
-					{{
-						"navigate": {{
-							"url": "{base_url}/dom-test-main",
-							"new_tab": false
-						}}
-					}}
-				]
-			}}
-			""",
-			"""
-			{
-				"thinking": "Done",
-				"evaluation_previous_goal": "Navigated",
-				"memory": "Complete",
-				"next_goal": "Done",
-				"action": [
-					{
-						"done": {
-							"text": "Done",
-							"success": true
-						}
-					}
-				]
-			}
-			""",
-		]
-
-		mock_llm = create_mock_llm(actions=actions)
-		agent = Agent(
-			task=f'Navigate to {base_url}/dom-test-main',
-			llm=mock_llm,
-			browser_session=browser_session,
-		)
-
-		history = await agent.run(max_steps=2)
+		await browser_session.navigate_to(f'{base_url}/dom-test-main')
 
 		# Get current browser state to access selector_map
 		browser_state_summary = await browser_session.get_browser_state_summary(

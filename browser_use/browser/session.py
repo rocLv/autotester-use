@@ -974,17 +974,29 @@ class BrowserSession(BaseModel):
 			# Close any extension options pages that might have opened
 			await self._close_extension_options_pages()
 
-			# Dispatch navigation complete
-			self.logger.debug(f'Dispatching NavigationCompleteEvent for {event.url} (tab #{target_id[-4:]})')
+			# Dispatch the browser's actual top-level URL, not merely the requested URL.
+			# SecurityWatchdog relies on this to catch HTTP/meta/SPA redirects that
+			# leave a QA Agent's allowed registrable-domain scope.
+			actual_url = event.url
+			try:
+				cdp_session = await self.get_or_create_cdp_session(target_id=target_id, focus=False)
+				location_result = await cdp_session.cdp_client.send.Runtime.evaluate(
+					params={'expression': 'window.location.href', 'returnByValue': True},
+					session_id=cdp_session.session_id,
+				)
+				actual_url = location_result.get('result', {}).get('value') or event.url
+			except Exception as e:
+				self.logger.debug(f'Could not resolve final navigation URL, using requested URL: {e}')
+			self.logger.debug(f'Dispatching NavigationCompleteEvent for {actual_url} (tab #{target_id[-4:]})')
 			await self.event_bus.dispatch(
 				NavigationCompleteEvent(
 					target_id=target_id,
-					url=event.url,
+					url=actual_url,
 					status=None,  # CDP doesn't provide status directly
 					loading_status=loading_status,  # non-None when readiness timed out
 				)
 			)
-			await self.event_bus.dispatch(AgentFocusChangedEvent(target_id=target_id, url=event.url))
+			await self.event_bus.dispatch(AgentFocusChangedEvent(target_id=target_id, url=actual_url))
 
 			# Note: These should be handled by dedicated watchdogs:
 			# - Security checks (security_watchdog)

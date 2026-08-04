@@ -152,5 +152,5 @@ async def test_budget_warning_contains_actionable_guidance():
 	messages = _get_context_messages(agent)
 	msg = messages[0]
 	assert 'consolidate your results' in msg.lower()
-	assert 'done' in msg.lower()
+	assert 'finish_test_step' in msg
 	assert 'partial results' in msg.lower()

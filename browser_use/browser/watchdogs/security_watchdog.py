@@ -6,6 +6,7 @@ from bubus import BaseEvent
 
 from browser_use.browser.events import (
 	BrowserErrorEvent,
+	BrowserStateRequestEvent,
 	NavigateToUrlEvent,
 	NavigationCompleteEvent,
 	TabCreatedEvent,
@@ -23,10 +24,11 @@ class SecurityWatchdog(BaseWatchdog):
 	"""Monitors and enforces security policies for URL access."""
 
 	# Event contracts
-	LISTENS_TO: ClassVar[list[type[BaseEvent]]] = [
+	LISTENS_TO = [
 		NavigateToUrlEvent,
 		NavigationCompleteEvent,
 		TabCreatedEvent,
+		BrowserStateRequestEvent,
 	]
 	EMITS: ClassVar[list[type[BaseEvent]]] = [
 		BrowserErrorEvent,
@@ -90,6 +92,27 @@ class SecurityWatchdog(BaseWatchdog):
 				self.logger.info(f'⛔️ Closed new tab with non-allowed URL: {event.url}')
 			except Exception as e:
 				self.logger.error(f'⛔️ Failed to close new tab with non-allowed URL: {type(e).__name__} {e}')
+
+	async def on_BrowserStateRequestEvent(self, event: BrowserStateRequestEvent) -> None:
+		"""Prevent an out-of-scope click or SPA route from reaching the QA model."""
+
+		if not self.browser_session.browser_profile.qa_root_url:
+			return
+		url = await self.browser_session.get_current_page_url()
+		if self._is_url_allowed(url):
+			return
+		self.logger.warning(f'⛔️ Out-of-scope QA page detected before state capture: {url}')
+		self.event_bus.dispatch(
+			BrowserErrorEvent(
+				error_type='NavigationBlocked',
+				message=f'Out-of-scope top-level page blocked before interaction: {url}',
+				details={'url': url, 'target_id': self.browser_session.agent_focus_target_id},
+			)
+		)
+		target_id = self.browser_session.agent_focus_target_id
+		if target_id:
+			session = await self.browser_session.get_or_create_cdp_session(target_id=target_id)
+			await session.cdp_client.send.Page.navigate(params={'url': 'about:blank'}, session_id=session.session_id)
 
 	def _is_root_domain(self, domain: str) -> bool:
 		"""Check if a domain is a root domain (no subdomain present).
@@ -183,7 +206,18 @@ class SecurityWatchdog(BaseWatchdog):
 			True if the URL is allowed, False otherwise
 		"""
 
-		# Always allow internal browser targets (before any other checks)
+		qa_root_url = self.browser_session.browser_profile.qa_root_url
+		if qa_root_url:
+			from browser_use.qa.navigation import NavigationScope
+
+			try:
+				if not NavigationScope.from_root_url(qa_root_url).allows(url):
+					return False
+			except ValueError:
+				return False
+
+		# Always allow internal browser targets (before normal domain checks). In QA mode,
+		# NavigationScope only admits lifecycle-safe blank/new-tab targets.
 		if url in ['about:blank', 'chrome://new-tab-page/', 'chrome://new-tab-page', 'chrome://newtab/']:
 			return True
 
@@ -196,7 +230,8 @@ class SecurityWatchdog(BaseWatchdog):
 			# Invalid URL
 			return False
 
-		# Allow data: and blob: URLs (they don't have hostnames)
+		# Allow data: and blob: URLs outside QA mode (they don't have hostnames).
+		# QA mode rejects them above because they are outside the test root.
 		if parsed.scheme in ['data', 'blob']:
 			return True
 
@@ -224,13 +259,17 @@ class SecurityWatchdog(BaseWatchdog):
 			if isinstance(allowed_domains, set):
 				# Fast path: O(1) exact hostname match - check both www and non-www variants
 				host_variant, host_alt = self._get_domain_variants(host)
-				return host_variant in allowed_domains or host_alt in allowed_domains
+				if host_variant not in allowed_domains and host_alt not in allowed_domains:
+					return False
 			else:
 				# Slow path: O(n) pattern matching for lists
-				for pattern in allowed_domains:
-					if self._is_url_match(url, host, parsed.scheme, pattern):
-						return True
-				return False
+				if not any(self._is_url_match(url, host, parsed.scheme, pattern) for pattern in allowed_domains):
+					return False
+
+			# In normal mode allowed_domains intentionally takes precedence for backwards
+			# compatibility. QA mode applies prohibited_domains as an additional narrowing rule.
+			if not qa_root_url:
+				return True
 
 		# Check prohibited domains (fast path for sets, slow path for lists with patterns)
 		if self.browser_session.browser_profile.prohibited_domains:
