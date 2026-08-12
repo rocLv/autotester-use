@@ -94,6 +94,7 @@ class AgentSettings(BaseModel):
 	max_agent_retries_per_step: int = Field(default=3, ge=0, le=3)
 	reuse_compiled_test_case: bool = True
 	reuse_login_state: bool = True
+	qa_step_limit: int | None = Field(default=None, ge=1)
 
 
 class PageFingerprint(BaseModel):

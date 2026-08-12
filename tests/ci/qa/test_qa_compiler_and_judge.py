@@ -17,6 +17,7 @@ from browser_use.qa.views import (
 	EvidenceQuality,
 	ExpectationSource,
 	ExpectationStatus,
+	FailureCode,
 	FailureOrigin,
 	QAStepStatus,
 	ReplayAssertion,
@@ -45,14 +46,33 @@ class _RelaxedDraftPayload(BaseModel):
 	steps: list[dict[str, object]]
 
 
-def _strict_evidence(*, action_status: ActionCompletionStatus = ActionCompletionStatus.COMPLETED) -> StepEvidence:
+class _RelaxedJudgementPayload(BaseModel):
+	action_status: str
+	expectation_status: str
+	status: str
+	failure_origin: str
+	failure_code: str = 'none'
+	reasoning: str
+	actual_result: str
+	evidence_ids: list[str] = []
+	confidence: float = 0.5
+	retry_safe: bool = False
+
+
+def _strict_evidence(
+	*,
+	action_status: ActionCompletionStatus = ActionCompletionStatus.COMPLETED,
+	target_matched: bool | None = True,
+	tool_succeeded: bool = True,
+	evidence_quality: EvidenceQuality = EvidenceQuality.STRONG,
+) -> StepEvidence:
 	action_artifact = EvidenceArtifact(evidence_id='ev_action', kind=EvidenceKind.ACTION, summary='verified click')
 	dom_artifact = EvidenceArtifact(evidence_id='ev_dom', kind=EvidenceKind.DOM, summary='Article editor')
 	receipt = ActionReceipt(
 		status=action_status,
 		operation_kind=StepOperationKind.CLICK,
-		tool_succeeded=action_status == ActionCompletionStatus.COMPLETED,
-		target_matched=action_status == ActionCompletionStatus.COMPLETED,
+		tool_succeeded=tool_succeeded,
+		target_matched=target_matched,
 		evidence_ids=['ev_action'],
 		reasoning='Runner-owned action receipt.',
 	)
@@ -65,7 +85,7 @@ def _strict_evidence(*, action_status: ActionCompletionStatus = ActionCompletion
 		),
 		action_receipt=receipt,
 		artifacts=[action_artifact],
-		evidence_quality=EvidenceQuality.STRONG,
+		evidence_quality=evidence_quality,
 	)
 
 
@@ -77,6 +97,12 @@ def test_compiler_types_login_preconditions_and_sensitive_references():
 
 	assert preconditions[0].mode == 'ensure'
 	assert preconditions[0].sensitive_refs == ['HALO_PASSWORD']
+
+
+def test_stage_one_schema_requires_source_evidence_from_the_model():
+	step_schema = WebUITestStepDraft.model_json_schema()
+
+	assert 'source_evidence' in step_schema['required']
 
 
 def test_invalid_response_status_assertion_is_a_safe_non_match():
@@ -176,6 +202,35 @@ async def test_chat_browser_use_compiler_asks_model_to_repair_missing_evidence()
 
 
 @pytest.mark.asyncio
+async def test_compiler_ignores_model_authored_provenance_and_derives_verified_span():
+	task = '打开 https://example.com/console。点击文章。预期结果：显示文章列表。'
+	llm = AsyncMock()
+	llm.provider = 'browser-use'
+	llm.ainvoke.return_value = ChatInvokeCompletion(
+		completion=BrowserUseJudgeTransport(
+			reasoning=(
+				'{"preconditions":[],"steps":[{"step_id":"step_1","instruction":"点击文章",'
+				'"expected_result":"显示文章列表","source_evidence":["预期结果：显示文章列表"],'
+				'"requirement_references":[{"source":"task","quote":"预期结果：显示文章列表"}],'
+				'"preconditions":[]}]}'
+			),
+			verdict=True,
+			failure_reason='',
+		),
+		usage=None,
+	)
+
+	draft = await QATaskCompiler(llm).extract_requirements(task=task)
+
+	reference = draft.steps[0].requirement_references[0]
+	assert llm.ainvoke.await_count == 1
+	assert reference.source == 'task'
+	assert reference.start is not None
+	assert reference.end is not None
+	assert task[reference.start : reference.end] == reference.quote
+
+
+@pytest.mark.asyncio
 async def test_chat_browser_use_compiler_asks_model_to_repair_malformed_json():
 	llm = AsyncMock()
 	llm.provider = 'browser-use'
@@ -201,6 +256,64 @@ async def test_chat_browser_use_compiler_asks_model_to_repair_malformed_json():
 	assert llm.ainvoke.await_count == 2
 	second_messages = llm.ainvoke.await_args_list[1].args[0]
 	assert 'Extra data' in str(second_messages[-1].content)
+
+
+@pytest.mark.asyncio
+async def test_compiler_asks_model_to_repair_non_verbatim_requirement_quote():
+	task = '打开 https://example.com/console。点击“文章”。预期结果：页面展示全部文章。'
+	invalid_quote = _RelaxedDraftPayload(
+		preconditions=[],
+		steps=[
+			{
+				'step_id': 'step_1',
+				'instruction': '点击文章',
+				'expected_result': '显示文章列表',
+				'source_evidence': ['点击‘文章’'],
+				'preconditions': [],
+			}
+		],
+	)
+	repaired = WebUITestCaseDraft(
+		steps=[
+			WebUITestStepDraft(
+				step_id='step_1',
+				instruction='点击文章',
+				expected_result='页面展示全部文章',
+				source_evidence=['预期结果：页面展示全部文章'],
+			)
+		]
+	)
+	llm = _mock_llm(invalid_quote, repaired)
+
+	draft = await QATaskCompiler(llm).extract_requirements(task=task)
+
+	assert llm.ainvoke.await_count == 2
+	assert draft.steps[0].requirement_references[0].quote == '预期结果：页面展示全部文章'
+	repair_messages = llm.ainvoke.await_args_list[1].args[0]
+	assert 'not an exact Task/ground_truth quote' in str(repair_messages[-1].content)
+
+
+@pytest.mark.asyncio
+async def test_compiler_uses_exact_expected_result_when_model_normalizes_evidence_punctuation():
+	task = '打开 https://example.com/console。点击“文章”。预期结果：显示文章列表。'
+	model_payload = _RelaxedDraftPayload(
+		preconditions=[],
+		steps=[
+			{
+				'step_id': 'step_1',
+				'instruction': '点击文章',
+				'expected_result': '显示文章列表',
+				'source_evidence': ['点击‘文章’'],
+				'preconditions': [],
+			}
+		],
+	)
+	llm = _mock_llm(model_payload)
+
+	draft = await QATaskCompiler(llm).extract_requirements(task=task)
+
+	assert llm.ainvoke.await_count == 1
+	assert draft.steps[0].requirement_references[0].quote == '显示文章列表'
 
 
 @pytest.mark.asyncio
@@ -289,7 +402,7 @@ async def test_compiler_preserves_explicit_expectation_and_marks_inferred_step()
 				expected_result='The page displays “Invalid password”',
 				source_evidence=['预期显示 Invalid password'],
 			),
-			WebUITestStepDraft(step_id='forgot-link', instruction='Open the forgot-password flow'),
+			WebUITestStepDraft(step_id='forgot-link', instruction='Open the forgot-password flow', source_evidence=[]),
 		]
 	)
 	compiled_payload = _CompiledPayload(steps=steps)
@@ -333,7 +446,7 @@ async def test_all_explicit_expectations_skip_page_discovery_completion():
 
 
 @pytest.mark.asyncio
-async def test_heuristic_expectation_cannot_be_reported_as_sut_failure():
+async def test_heuristic_expectation_can_be_reported_as_sut_failure_from_facts():
 	step = WebUITestStep(
 		step_id='heuristic',
 		instruction='Click the tile',
@@ -351,12 +464,195 @@ async def test_heuristic_expectation_cannot_be_reported_as_sut_failure():
 	)
 	evidence = _strict_evidence()
 	judgement = await judge_test_step(llm=_mock_llm(judge_output), step=step, evidence=evidence)
-	assert judgement.status == QAStepStatus.INCONCLUSIVE
-	assert judgement.failure_origin == FailureOrigin.UNKNOWN
+	assert judgement.status == QAStepStatus.SUT_FAILED
+	assert judgement.failure_origin == FailureOrigin.SUT
 
 
 @pytest.mark.asyncio
-async def test_chat_browser_use_natural_language_positive_verdict_is_inconclusive_in_qa_v2():
+async def test_judge_llm_schema_rejects_inconclusive_status():
+	step = WebUITestStep(
+		step_id='new-article',
+		instruction='Click New',
+		expected_result='The editor is visible',
+		expectation_source=ExpectationSource.EXPLICIT,
+		source_evidence=['Expected editor'],
+	)
+	llm = _mock_llm(
+		StepJudgement(
+			action_status=ActionCompletionStatus.COMPLETED,
+			expectation_status=ExpectationStatus.MET,
+			status=QAStepStatus.PASSED,
+			failure_origin=FailureOrigin.NONE,
+			reasoning='The editor is visible.',
+			actual_result='Article editor visible.',
+			evidence_ids=['ev_dom'],
+		)
+	)
+
+	judgement = await judge_test_step(llm=llm, step=step, evidence=_strict_evidence())
+	output_format = llm.ainvoke.await_args.kwargs['output_format']
+
+	assert judgement.status == QAStepStatus.PASSED
+	assert 'INCONCLUSIVE' in output_format.model_json_schema()['$defs']['QAStepStatus']['enum']
+
+	with pytest.raises(ValueError, match='concrete status'):
+		output_format(
+			action_status=ActionCompletionStatus.COMPLETED,
+			expectation_status=ExpectationStatus.NOT_OBSERVABLE,
+			status=QAStepStatus.INCONCLUSIVE,
+			failure_origin=FailureOrigin.UNKNOWN,
+			reasoning='I cannot decide.',
+			actual_result='Unknown.',
+		)
+
+
+@pytest.mark.asyncio
+async def test_judge_accepts_concrete_verdict_without_evidence_ids():
+	step = WebUITestStep(
+		step_id='new-article',
+		instruction='Click New',
+		expected_result='The editor is visible',
+		expectation_source=ExpectationSource.EXPLICIT,
+		source_evidence=['Expected editor'],
+	)
+	missing_citation = StepJudgement(
+		action_status=ActionCompletionStatus.COMPLETED,
+		expectation_status=ExpectationStatus.MET,
+		status=QAStepStatus.PASSED,
+		failure_origin=FailureOrigin.NONE,
+		reasoning='The editor is visible.',
+		actual_result='Article editor visible.',
+	)
+	llm = _mock_llm(missing_citation)
+	call_count = 0
+
+	def count_call() -> None:
+		nonlocal call_count
+		call_count += 1
+
+	judgement = await judge_test_step(
+		llm=llm,
+		step=step,
+		evidence=_strict_evidence(),
+		on_llm_call=count_call,
+	)
+
+	assert judgement.status == QAStepStatus.PASSED
+	assert judgement.evidence_ids == []
+	assert llm.ainvoke.await_count == 1
+	assert call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_judge_repairs_repeated_schema_invalid_outputs_with_llm():
+	step = WebUITestStep(
+		step_id='publish',
+		instruction='Click Publish in the article settings modal',
+		expected_result='The article appears in the management list and on the homepage.',
+		expectation_source=ExpectationSource.EXPLICIT,
+		source_evidence=['Expected article appears in both places'],
+	)
+	evidence = _strict_evidence(action_status=ActionCompletionStatus.COMPLETED)
+	http_502_artifact = EvidenceArtifact(evidence_id='ev_http_502', kind=EvidenceKind.NETWORK, summary='HTTP 502 document')
+	evidence.after = BrowserEvidenceSnapshot(
+		url='https://demo.halocms.site/console/posts',
+		dom_summary='HTTP ERROR 502',
+		network_errors=['HTTP 502 [Document] https://demo.halocms.site/console/posts'],
+		artifacts=[http_502_artifact],
+	)
+	evidence.artifacts.append(http_502_artifact)
+	invalid_output = _RelaxedJudgementPayload(
+		action_status='not_completed',
+		expectation_status='not_met',
+		status='SUT_FAILED',
+		failure_origin='sut',
+		failure_code='sut_related_http_error',
+		reasoning='The page returned HTTP 502.',
+		actual_result='HTTP 502 prevented verification.',
+		evidence_ids=['ev_http_502'],
+	)
+	repaired_output = StepJudgement(
+		action_status=ActionCompletionStatus.COMPLETED,
+		expectation_status=ExpectationStatus.NOT_MET,
+		status=QAStepStatus.SUT_FAILED,
+		failure_origin=FailureOrigin.SUT,
+		failure_code=FailureCode.SUT_RELATED_HTTP_ERROR,
+		reasoning='The publish action was attempted, but the expected article visibility was absent after HTTP 502.',
+		actual_result='The page shows HTTP ERROR 502 instead of the article list or homepage article.',
+		evidence_ids=['ev_http_502'],
+	)
+	llm = _mock_llm(invalid_output, invalid_output, repaired_output)
+
+	judgement = await judge_test_step(llm=llm, step=step, evidence=evidence)
+
+	assert judgement.status == QAStepStatus.SUT_FAILED
+	assert judgement.failure_code == FailureCode.SUT_RELATED_HTTP_ERROR
+	assert judgement.evidence_ids == ['ev_http_502']
+	assert llm.ainvoke.await_count == 3
+	repair_messages = llm.ainvoke.await_args_list[1].args[0]
+	assert 'previous structured judgement was rejected' in str(repair_messages[-1].content)
+	assert 'SUT_FAILED requires objective evidence that the action completed' in str(repair_messages[-1].content)
+
+
+@pytest.mark.asyncio
+async def test_judge_uses_llm_even_when_custom_tool_expectation_exists():
+	step = WebUITestStep(
+		step_id='slider',
+		instruction='Complete the slider',
+		expected_result='The slider displays verification successful.',
+		expectation_source=ExpectationSource.EXPLICIT,
+		source_evidence=['预期结果：验证成功'],
+	)
+	action_artifact = EvidenceArtifact(
+		evidence_id='ev_slider_action',
+		kind=EvidenceKind.ACTION,
+		summary='Slider success checked by custom tool',
+		metadata={
+			'tool_expectation_proofs': [
+				{
+					'requirement_quote': '滑块区域明确显示“验证成功”。',
+					'expectation_met': True,
+					'verification': {'site_success_observed': True},
+				}
+			]
+		},
+	)
+	receipt = ActionReceipt(
+		status=ActionCompletionStatus.COMPLETED,
+		operation_kind=StepOperationKind.OTHER,
+		tool_succeeded=True,
+		target_matched=True,
+		evidence_ids=['ev_slider_action'],
+		reasoning='The slider action completed.',
+	)
+	evidence = StepEvidence(
+		before=BrowserEvidenceSnapshot(url='https://example.com/register', dom_summary='请拖动滑块'),
+		after=BrowserEvidenceSnapshot(url='https://example.com/register', dom_summary='验证成功'),
+		action_receipt=receipt,
+		artifacts=[action_artifact],
+		evidence_quality=EvidenceQuality.STRONG,
+	)
+	llm = _mock_llm(
+		StepJudgement(
+			action_status=ActionCompletionStatus.COMPLETED,
+			expectation_status=ExpectationStatus.MET,
+			status=QAStepStatus.PASSED,
+			failure_origin=FailureOrigin.NONE,
+			reasoning='The final page displays verification successful.',
+			actual_result='Verification success is visible.',
+			evidence_ids=['ev_slider_action'],
+		)
+	)
+
+	judgement = await judge_test_step(llm=llm, step=step, evidence=evidence)
+
+	assert judgement.status == QAStepStatus.PASSED
+	assert judgement.evidence_ids == ['ev_slider_action']
+	assert llm.ainvoke.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_chat_browser_use_natural_language_positive_verdict_is_passed():
 	step = WebUITestStep(
 		step_id='new-article',
 		instruction='Click New',
@@ -378,13 +674,12 @@ async def test_chat_browser_use_natural_language_positive_verdict_is_inconclusiv
 
 	judgement = await judge_test_step(llm=llm, step=step, evidence=evidence)
 
-	assert judgement.status == QAStepStatus.INCONCLUSIVE
-	assert judgement.failure_origin == FailureOrigin.UNKNOWN
-	assert judgement.replay_assertions == []
+	assert judgement.status == QAStepStatus.PASSED
+	assert judgement.failure_origin == FailureOrigin.NONE
 
 
 @pytest.mark.asyncio
-async def test_uncompleted_action_receipt_cannot_be_upgraded_to_sut_failure():
+async def test_action_receipt_does_not_gate_fact_based_sut_failure():
 	step = WebUITestStep(
 		step_id='new-article',
 		instruction='Click New',
@@ -392,7 +687,7 @@ async def test_uncompleted_action_receipt_cannot_be_upgraded_to_sut_failure():
 		expectation_source=ExpectationSource.EXPLICIT,
 		source_evidence=['Expected editor'],
 	)
-	evidence = _strict_evidence(action_status=ActionCompletionStatus.NOT_COMPLETED)
+	evidence = _strict_evidence(action_status=ActionCompletionStatus.NOT_COMPLETED, target_matched=False, tool_succeeded=False)
 	llm = _mock_llm(
 		StepJudgement(
 			action_status=ActionCompletionStatus.COMPLETED,
@@ -407,6 +702,45 @@ async def test_uncompleted_action_receipt_cannot_be_upgraded_to_sut_failure():
 
 	judgement = await judge_test_step(llm=llm, step=step, evidence=evidence)
 
-	assert judgement.status == QAStepStatus.AGENT_FAILED
-	assert judgement.failure_origin == FailureOrigin.AGENT
-	assert llm.ainvoke.await_count == 0
+	assert judgement.status == QAStepStatus.SUT_FAILED
+	assert judgement.failure_origin == FailureOrigin.SUT
+	assert llm.ainvoke.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_judge_passes_from_facts_when_element_target_is_not_verified():
+	step = WebUITestStep(
+		step_id='articles',
+		instruction='点击侧边栏或导航中的“文章”。',
+		expected_result='显示文章列表。',
+		expectation_source=ExpectationSource.EXPLICIT,
+		source_evidence=['1. 点击文章；预期结果：显示文章列表。'],
+	)
+	evidence = _strict_evidence(
+		action_status=ActionCompletionStatus.COMPLETED,
+		target_matched=None,
+		evidence_quality=EvidenceQuality.WEAK,
+	)
+	evidence.after = BrowserEvidenceSnapshot(
+		url='https://demo.halocms.site/console/posts',
+		title='Halo 演示站点',
+		dom_summary='文章 分类 标签 回收站 新建',
+		artifacts=[EvidenceArtifact(evidence_id='ev_dom', kind=EvidenceKind.DOM, summary='文章 分类 标签 回收站 新建')],
+	)
+	llm = _mock_llm(
+		StepJudgement(
+			action_status=ActionCompletionStatus.COMPLETED,
+			expectation_status=ExpectationStatus.MET,
+			status=QAStepStatus.PASSED,
+			failure_origin=FailureOrigin.NONE,
+			reasoning='The after-state is the posts page and shows article list controls.',
+			actual_result='The article list page is visible.',
+			evidence_ids=['ev_dom'],
+		)
+	)
+
+	judgement = await judge_test_step(llm=llm, step=step, evidence=evidence)
+
+	assert judgement.status == QAStepStatus.PASSED
+	assert judgement.failure_origin == FailureOrigin.NONE
+	assert llm.ainvoke.await_count == 1

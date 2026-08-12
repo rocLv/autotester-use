@@ -28,6 +28,7 @@ from browser_use.qa.views import (
 	ReplayAssertionKind,
 	StepEvidence,
 	StepJudgement,
+	StepOperationKind,
 	WebUITestCase,
 	WebUITestStep,
 )
@@ -90,6 +91,66 @@ def _agent(step_count: int = 2) -> Agent:
 	agent._build_qa_evidence = AsyncMock(return_value=_evidence())
 	agent.history.add_item(_boundary_history())
 	return agent
+
+
+def test_custom_tool_target_proof_completes_input_action_receipt():
+	agent = _agent(step_count=1)
+	step = agent._qa_test_case.steps[0].model_copy(update={'operation_kind': StepOperationKind.INPUT})  # type: ignore[union-attr]
+	receipt, artifact = agent._build_action_receipt(
+		step=step,
+		before=BrowserEvidenceSnapshot(url='https://example.com/app', dom_summary='Empty form'),
+		after=BrowserEvidenceSnapshot(url='https://example.com/app', dom_summary='Completed form'),
+		action_results=[
+			ActionResult(
+				extracted_content='Form fields verified',
+				metadata={
+					'qa_target_proof': {
+						'target_name': 'registration form fields',
+						'target_matched': True,
+						'verification': {'phone_valid': True, 'password_valid': True},
+					}
+				},
+			).model_dump(exclude_none=True, mode='json')
+		],
+		action_names=['fill_registration_form'],
+		selected_element=None,
+		input_values=[],
+		side_effect_uncertain=False,
+	)
+
+	assert receipt.status == ActionCompletionStatus.COMPLETED
+	assert receipt.target_matched is True
+	assert artifact.metadata['tool_target_proofs'][0]['target_name'] == 'registration form fields'
+
+
+def test_failed_custom_tool_cannot_use_target_proof_to_complete_receipt():
+	agent = _agent(step_count=1)
+	step = agent._qa_test_case.steps[0].model_copy(update={'operation_kind': StepOperationKind.INPUT})  # type: ignore[union-attr]
+	receipt, _ = agent._build_action_receipt(
+		step=step,
+		before=BrowserEvidenceSnapshot(url='https://example.com/app', dom_summary='Empty form'),
+		after=BrowserEvidenceSnapshot(url='https://example.com/app', dom_summary='Empty form'),
+		action_results=[
+			ActionResult(
+				error='Input dispatch failed',
+				metadata={
+					'qa_target_proof': {
+						'target_name': 'registration form fields',
+						'target_matched': True,
+						'verification': {'phone_valid': True},
+					}
+				},
+			).model_dump(exclude_none=True, mode='json')
+		],
+		action_names=['fill_registration_form'],
+		selected_element=None,
+		input_values=[],
+		side_effect_uncertain=False,
+	)
+
+	assert receipt.status == ActionCompletionStatus.NOT_COMPLETED
+	assert receipt.tool_succeeded is False
+	assert receipt.target_matched is None
 
 
 @pytest.mark.asyncio
@@ -639,6 +700,21 @@ def test_same_task_followup_can_disable_compiled_case_reuse():
 	agent.add_new_task(agent._qa_original_task)
 
 	assert agent._qa_test_case is None
+
+
+def test_qa_step_limit_trims_compiled_case_inside_agent_core():
+	agent = Agent(
+		task='Test https://example.com/app',
+		llm=create_mock_llm(),
+		qa_test_case=_case(step_count=3),
+		qa_step_limit=1,
+	)
+
+	agent._apply_qa_execution_limits()
+
+	assert agent._qa_test_case is not None
+	assert [step.step_id for step in agent._qa_test_case.steps] == ['step-1']
+	assert agent._qa_warnings == ['QA execution limited to first 1 of 3 compiled business steps.']
 
 
 def test_cached_login_state_is_limited_to_qa_navigation_scope():

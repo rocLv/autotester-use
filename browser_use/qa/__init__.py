@@ -1,6 +1,20 @@
 """Typed Web UI QA primitives used by :class:`browser_use.Agent`."""
 
 from browser_use.qa.bundle import QABundle, QABundleManifest, QABundleRevision, qa_content_hash
+from browser_use.qa.chrome_recorder import (
+	ChromeRecorderFlow,
+	ChromeRecorderPlaybackError,
+	ChromeRecorderPlaybackResult,
+	ChromeRecorderPlaybackStatus,
+	ChromeRecorderPlayer,
+	ChromeRecorderStep,
+	ChromeRecorderStepResult,
+	ChromeRecorderStepStatus,
+	export_agent_history_to_chrome_recorder,
+	load_chrome_recorder_flow,
+	write_agent_history_chrome_recorder_flow,
+	write_chrome_recorder_flow,
+)
 from browser_use.qa.compiler import QATaskCompiler, WebUITestCaseDraft, WebUITestStepDraft, extract_task_urls
 from browser_use.qa.evaluation import QAEvaluationMetrics, QAEvaluationSample, evaluate_qa_runs
 from browser_use.qa.judge import judge_test_step
@@ -15,7 +29,9 @@ from browser_use.qa.reporting import (
 )
 from browser_use.qa.views import (
 	ActionCompletionStatus,
+	ActionExpectationProof,
 	ActionReceipt,
+	ActionTargetProof,
 	BrowserEvidenceSnapshot,
 	EvidenceArtifact,
 	EvidenceKind,
@@ -50,8 +66,18 @@ from browser_use.qa.views import (
 
 __all__ = [
 	'ActionCompletionStatus',
+	'ActionExpectationProof',
 	'ActionReceipt',
+	'ActionTargetProof',
 	'BrowserEvidenceSnapshot',
+	'ChromeRecorderFlow',
+	'ChromeRecorderPlaybackError',
+	'ChromeRecorderPlaybackResult',
+	'ChromeRecorderPlaybackStatus',
+	'ChromeRecorderPlayer',
+	'ChromeRecorderStep',
+	'ChromeRecorderStepResult',
+	'ChromeRecorderStepStatus',
 	'EvidenceArtifact',
 	'EvidenceKind',
 	'EvidenceQuality',
@@ -92,11 +118,15 @@ __all__ = [
 	'WebUITestStepDraft',
 	'extract_task_urls',
 	'evaluate_qa_runs',
+	'export_agent_history_to_chrome_recorder',
 	'invoke_qa_structured',
 	'judge_test_step',
+	'load_chrome_recorder_flow',
 	'qa_content_hash',
 	'qa_html_report',
 	'qa_junit_xml',
+	'write_agent_history_chrome_recorder_flow',
+	'write_chrome_recorder_flow',
 	'write_qa_html_report',
 	'write_qa_json_report',
 	'write_qa_junit_report',

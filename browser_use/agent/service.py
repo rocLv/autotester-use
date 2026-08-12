@@ -72,13 +72,22 @@ from browser_use.dom.views import DOMInteractedElement, MatchLevel
 from browser_use.filesystem.file_system import FileSystem
 from browser_use.observability import observe, observe_debug
 from browser_use.qa.bundle import QABundle, qa_content_hash
+from browser_use.qa.chrome_recorder import (
+	ChromeRecorderFlow,
+	ChromeRecorderPlaybackResult,
+	ChromeRecorderPlayer,
+	export_agent_history_to_chrome_recorder,
+	write_agent_history_chrome_recorder_flow,
+)
 from browser_use.qa.compiler import QATaskCompiler, WebUITestCaseDraft
 from browser_use.qa.evidence import QAEvidenceCursor, QAEvidenceMonitor
 from browser_use.qa.judge import judge_test_step, replay_assertion_matches
 from browser_use.qa.navigation import NavigationScope
 from browser_use.qa.views import (
 	ActionCompletionStatus,
+	ActionExpectationProof,
 	ActionReceipt,
+	ActionTargetProof,
 	BrowserEvidenceSnapshot,
 	EvidenceArtifact,
 	EvidenceKind,
@@ -263,6 +272,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		qa_test_case: WebUITestCase | None = None,
 		reuse_compiled_test_case: bool = True,
 		reuse_login_state: bool = True,
+		qa_step_limit: int | None = None,
 		_url_shortening_limit: int = 25,
 		enable_signal_handler: bool = True,
 		**kwargs,
@@ -273,6 +283,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			raise ValueError('initial_actions are not supported in QA mode; describe setup as a test step with an expectation')
 		if not 0 <= max_agent_retries_per_step <= 3:
 			raise ValueError('max_agent_retries_per_step must be between 0 and 3')
+		if qa_step_limit is not None and qa_step_limit < 1:
+			raise ValueError('qa_step_limit must be at least 1 when provided')
 
 		self._qa_original_task = task
 		self._qa_scope: NavigationScope | None = None
@@ -573,6 +585,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			max_agent_retries_per_step=max_agent_retries_per_step,
 			reuse_compiled_test_case=reuse_compiled_test_case,
 			reuse_login_state=reuse_login_state,
+			qa_step_limit=qa_step_limit,
 		)
 
 		# Token cost service
@@ -1267,6 +1280,11 @@ For submit, delete, payment, or other irreversible actions, do not repeat the ac
 
 		self._qa_phase_timings[phase] = self._qa_phase_timings.get(phase, 0.0) + max(elapsed_seconds, 0.0)
 		self._sync_qa_phase_timings()
+
+	def _record_qa_llm_call(self) -> None:
+		"""Count one provider invocation performed by a QA compiler, executor, or Judge."""
+
+		self._qa_llm_call_count += 1
 
 	def _sync_qa_phase_timings(self) -> None:
 		"""Expose current runner timings through the strongly typed QA result."""
@@ -3971,6 +3989,7 @@ Expected state: {step.expected_result}"""
 			self._qa_llm_call_count += compiler.call_count
 
 		self._qa_compiled_task = self._qa_original_task
+		self._apply_qa_execution_limits()
 		self._log_qa_test_case_table('📋 Structured QA test case')
 		await self._start_qa_execution()
 
@@ -3979,6 +3998,7 @@ Expected state: {step.expected_result}"""
 
 		assert self._qa_scope is not None
 		assert self._qa_test_case is not None
+		self._apply_qa_execution_limits()
 		self._log_qa_test_case_table('♻️ Reused structured QA test case')
 		await self.browser_session.navigate_to(self._qa_scope.root_url, new_tab=False)
 		await self._wait_for_qa_page_stability()
@@ -3993,6 +4013,21 @@ Expected state: {step.expected_result}"""
 		if sensitive_values:
 			table = redact_sensitive_string(table, sensitive_values)
 		self.logger.info(f'{label}:\n{table}')
+
+	def _apply_qa_execution_limits(self) -> None:
+		"""Apply runner-owned execution limits after LLM QA compilation."""
+
+		if self._qa_test_case is None or self.settings.qa_step_limit is None:
+			return
+		limit = self.settings.qa_step_limit
+		total_steps = len(self._qa_test_case.steps)
+		if total_steps <= limit:
+			return
+		self._qa_test_case = self._qa_test_case.model_copy(
+			update={'steps': self._qa_test_case.steps[:limit]},
+			deep=True,
+		)
+		self._qa_warnings.append(f'QA execution limited to first {limit} of {total_steps} compiled business steps.')
 
 	async def _start_qa_execution(self) -> None:
 		"""Initialize per-run QA execution state after compilation or cache reuse."""
@@ -4105,11 +4140,30 @@ Expected state: {step.expected_result}"""
 		operation = self._qa_effective_operation(step, action_names)
 		errors = [str(result.get('error')) for result in action_results if result.get('error')]
 		tool_succeeded = not errors and (bool(action_results) or operation == StepOperationKind.OBSERVE)
-		target_matched = (
-			True
-			if operation in {StepOperationKind.OBSERVE, StepOperationKind.NAVIGATE}
-			else self._qa_selected_element_matches(step, selected_element)
-		)
+		tool_target_proofs: list[ActionTargetProof] = []
+		tool_expectation_proofs: list[ActionExpectationProof] = []
+		for result in action_results:
+			if result.get('error'):
+				continue
+			metadata = result.get('metadata')
+			if not isinstance(metadata, dict):
+				continue
+			if 'qa_target_proof' in metadata:
+				try:
+					tool_target_proofs.append(ActionTargetProof.model_validate(metadata['qa_target_proof']))
+				except ValidationError as exc:
+					logger.warning('Ignoring malformed qa_target_proof from a custom action: %s', exc)
+			if 'qa_expectation_proof' in metadata:
+				try:
+					tool_expectation_proofs.append(ActionExpectationProof.model_validate(metadata['qa_expectation_proof']))
+				except ValidationError as exc:
+					logger.warning('Ignoring malformed qa_expectation_proof from a custom action: %s', exc)
+		if operation in {StepOperationKind.OBSERVE, StepOperationKind.NAVIGATE}:
+			target_matched = True
+		elif tool_target_proofs:
+			target_matched = all(proof.target_matched for proof in tool_target_proofs)
+		else:
+			target_matched = self._qa_selected_element_matches(step, selected_element)
 		state_changed = before.url != after.url or before.dom_summary != after.dom_summary
 		related_network = [
 			artifact
@@ -4142,15 +4196,21 @@ Expected state: {step.expected_result}"""
 			status = ActionCompletionStatus.NOT_COMPLETED
 			reasoning = 'No successful tool action was recorded for the business step.'
 		elif target_matched is False:
-			status = ActionCompletionStatus.NOT_COMPLETED
-			reasoning = 'The interacted element does not match the target described by the business step.'
+			status = ActionCompletionStatus.COMPLETED
+			reasoning = (
+				'The tool action was dispatched successfully; element-level target metadata did not match the '
+				'business step, so final judgement must use observable browser facts.'
+			)
 		elif target_matched is None and operation in {
 			StepOperationKind.CLICK,
 			StepOperationKind.INPUT,
 			StepOperationKind.SUBMIT,
 		}:
-			status = ActionCompletionStatus.UNCERTAIN
-			reasoning = 'The tool succeeded, but the intended target element cannot be verified.'
+			status = ActionCompletionStatus.COMPLETED
+			reasoning = (
+				'The tool action was dispatched successfully; element-level target proof is unavailable, so final '
+				'judgement must use observable browser facts.'
+			)
 		else:
 			status = ActionCompletionStatus.COMPLETED
 			reasoning = 'The intended action was dispatched successfully to the verified target.'
@@ -4162,6 +4222,8 @@ Expected state: {step.expected_result}"""
 				'input_values': input_values,
 				'tool_succeeded': tool_succeeded,
 				'target_matched': target_matched,
+				'tool_target_proofs': [proof.model_dump(mode='json') for proof in tool_target_proofs],
+				'tool_expectation_proofs': [proof.model_dump(mode='json') for proof in tool_expectation_proofs],
 				'side_effect_uncertain': side_effect_uncertain,
 				'errors': errors,
 			},
@@ -4171,7 +4233,11 @@ Expected state: {step.expected_result}"""
 			kind=EvidenceKind.ACTION,
 			summary=action_summary,
 			url=after.url,
-			metadata={'selected_element': selected_element or {}},
+			metadata={
+				'selected_element': selected_element or {},
+				'tool_target_proofs': [proof.model_dump(mode='json') for proof in tool_target_proofs],
+				'tool_expectation_proofs': [proof.model_dump(mode='json') for proof in tool_expectation_proofs],
+			},
 		)
 		related_requests = related_network
 		receipt = ActionReceipt(
@@ -4472,12 +4538,12 @@ Expected state: {step.expected_result}"""
 			self._qa_current_attempt_receipts.append(evidence.action_receipt)
 		review: ReviewRecord | None = None
 		try:
-			self._qa_llm_call_count += 1
 			judgement = await judge_test_step(
 				llm=self.judge_llm,
 				step=step,
 				evidence=evidence,
 				action_receipt=evidence.action_receipt,
+				on_llm_call=self._record_qa_llm_call,
 			)
 		except Exception as exc:
 			self.logger.error(f'Independent QA step judge failed: {exc}', exc_info=True)
@@ -4508,12 +4574,12 @@ Expected state: {step.expected_result}"""
 				evidence_ids=judgement.evidence_ids,
 			)
 			try:
-				self._qa_llm_call_count += 1
 				secondary = await judge_test_step(
 					llm=self.review_llm,
 					step=step,
 					evidence=evidence,
 					action_receipt=evidence.action_receipt,
+					on_llm_call=self._record_qa_llm_call,
 				)
 				review.secondary_status = secondary.status
 				review.agreed = secondary.status == judgement.status
@@ -6410,6 +6476,40 @@ Expected state: {step.expected_result}"""
 		if not file_path:
 			file_path = 'AgentHistory.json'
 		self.history.save_to_file(file_path, sensitive_data=self.sensitive_data)
+
+	def export_chrome_recording(self, *, title: str = 'Browser Use recording') -> ChromeRecorderFlow:
+		"""Export current action history as a Chrome DevTools Recorder flow."""
+
+		return export_agent_history_to_chrome_recorder(self.history, title=title)
+
+	def save_chrome_recording(self, file_path: str | Path | None = None, *, title: str = 'Browser Use recording') -> Path:
+		"""Save current action history as a Chrome DevTools Recorder JSON file."""
+
+		if not file_path:
+			file_path = 'ChromeRecorder.json'
+		return write_agent_history_chrome_recorder_flow(self.history, file_path, title=title)
+
+	async def replay_chrome_recording(
+		self,
+		recording: str | Path | dict[str, Any] | ChromeRecorderFlow,
+		*,
+		max_steps: int | None = None,
+		default_timeout_ms: int = 5000,
+		stop_on_error: bool = True,
+		skip_unsupported: bool = False,
+		wait_after_step_ms: int = 0,
+	) -> ChromeRecorderPlaybackResult:
+		"""Replay a Chrome DevTools Recorder flow in the agent's current browser session."""
+
+		await self.browser_session.start()
+		player = ChromeRecorderPlayer(
+			self.browser_session,
+			default_timeout_ms=default_timeout_ms,
+			stop_on_error=stop_on_error,
+			skip_unsupported=skip_unsupported,
+			wait_after_step_ms=wait_after_step_ms,
+		)
+		return await player.replay(recording, max_steps=max_steps)
 
 	def pause(self) -> None:
 		"""Pause the agent before the next step"""

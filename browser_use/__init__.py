@@ -75,6 +75,8 @@ if TYPE_CHECKING:
 	from browser_use.llm.vercel.chat import ChatVercel
 	from browser_use.qa import (
 		ActionReceipt,
+		ChromeRecorderFlow,
+		ChromeRecorderPlayer,
 		EvidenceArtifact,
 		QABundle,
 		QAPrecondition,
@@ -83,6 +85,10 @@ if TYPE_CHECKING:
 		RequirementReference,
 		WebUITestCase,
 		WebUITestStep,
+		export_agent_history_to_chrome_recorder,
+		load_chrome_recorder_flow,
+		write_agent_history_chrome_recorder_flow,
+		write_chrome_recorder_flow,
 	)
 	from browser_use.sandbox import sandbox
 	from browser_use.tools.service import Controller, Tools
@@ -102,6 +108,8 @@ _LAZY_IMPORTS = {
 	'BrowserProfile': ('browser_use.browser', 'BrowserProfile'),
 	'ApiCollectionConfig': ('browser_use.browser', 'ApiCollectionConfig'),
 	'ActionReceipt': ('browser_use.qa', 'ActionReceipt'),
+	'ChromeRecorderFlow': ('browser_use.qa', 'ChromeRecorderFlow'),
+	'ChromeRecorderPlayer': ('browser_use.qa', 'ChromeRecorderPlayer'),
 	'EvidenceArtifact': ('browser_use.qa', 'EvidenceArtifact'),
 	'QAPrecondition': ('browser_use.qa', 'QAPrecondition'),
 	'QABundle': ('browser_use.qa', 'QABundle'),
@@ -110,6 +118,10 @@ _LAZY_IMPORTS = {
 	'RequirementReference': ('browser_use.qa', 'RequirementReference'),
 	'WebUITestCase': ('browser_use.qa', 'WebUITestCase'),
 	'WebUITestStep': ('browser_use.qa', 'WebUITestStep'),
+	'load_chrome_recorder_flow': ('browser_use.qa', 'load_chrome_recorder_flow'),
+	'write_chrome_recorder_flow': ('browser_use.qa', 'write_chrome_recorder_flow'),
+	'export_agent_history_to_chrome_recorder': ('browser_use.qa', 'export_agent_history_to_chrome_recorder'),
+	'write_agent_history_chrome_recorder_flow': ('browser_use.qa', 'write_agent_history_chrome_recorder_flow'),
 	# Tools (moderate weight)
 	'Tools': ('browser_use.tools.service', 'Tools'),
 	'Controller': ('browser_use.tools.service', 'Controller'),  # alias
@@ -163,6 +175,8 @@ __all__ = [
 	'BrowserProfile',
 	'ApiCollectionConfig',
 	'ActionReceipt',
+	'ChromeRecorderFlow',
+	'ChromeRecorderPlayer',
 	'EvidenceArtifact',
 	'QABundle',
 	'QAPrecondition',
@@ -177,6 +191,10 @@ __all__ = [
 	'ActionResult',
 	'ActionModel',
 	'AgentHistoryList',
+	'load_chrome_recorder_flow',
+	'write_chrome_recorder_flow',
+	'export_agent_history_to_chrome_recorder',
+	'write_agent_history_chrome_recorder_flow',
 	# Chat models
 	'ChatOpenAI',
 	'ChatGoogle',

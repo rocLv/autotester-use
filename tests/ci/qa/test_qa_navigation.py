@@ -18,6 +18,23 @@ def test_extract_task_urls_preserves_order_and_requires_explicit_http_urls():
 	assert extract_task_urls('Open example.com and check it') == []
 
 
+def test_extract_task_urls_handles_rich_text_markdown_links_without_caller_preprocessing():
+	task = (
+		'后台地址：<a href="[https://demo.halocms.site/console\\">]'
+		'(https://demo.halocms.site/console\\">)'
+		'<u>[https://demo.halocms.site/console](https://demo.halocms.site/console)</u></a>\n'
+		'进入管理登录页<a href="[https://demo.halocms.site/console/dashboard\\">'
+		'https://demo.halocms.site/console/dashboard]'
+		'(https://demo.halocms.site/console/dashboard\\">https://demo.halocms.site/console/dashboard)</a>'
+	)
+
+	assert extract_task_urls(task) == [
+		'https://demo.halocms.site/console',
+		'https://demo.halocms.site/console/dashboard',
+	]
+	assert QATaskCompiler.resolve_scope(task).root_url == 'https://demo.halocms.site/console'
+
+
 def test_navigation_scope_allows_registrable_domain_and_subdomains():
 	scope = NavigationScope.from_root_url('https://foo.example.co.uk/app')
 	assert scope.registrable_domain == 'example.co.uk'

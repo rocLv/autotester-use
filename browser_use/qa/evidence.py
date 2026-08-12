@@ -46,6 +46,7 @@ class QAEvidenceMonitor:
 	"""Collect failed requests, HTTP errors, and unhandled page exceptions via CDP."""
 
 	_MAX_ITEMS = 500
+	_SUCCESS_EVIDENCE_RESOURCE_TYPES = frozenset({'Document', 'Fetch', 'XHR'})
 
 	def __init__(self, browser_session: Any, navigation_scope: NavigationScope | None = None):
 		self.browser_session = browser_session
@@ -138,15 +139,19 @@ class QAEvidenceMonitor:
 			return
 		url = str(_get(response, 'url') or self._request_urls.get(request_id, 'unknown URL'))
 		resource_type = str(_get(params, 'type', 'unknown'))
-		self._append_network_event(
-			QANetworkEvent(
-				request_id=request_id,
-				method=self._request_methods.get(request_id, 'GET'),
-				url=url,
-				resource_type=resource_type,
-				status=status_code,
+		# Successful images, fonts, stylesheets, and data URLs are page-loading noise,
+		# not business evidence. Keeping them can flood the Judge context with encoded
+		# assets and prevent it from citing the small set of relevant evidence IDs.
+		if status_code >= 400 or resource_type in self._SUCCESS_EVIDENCE_RESOURCE_TYPES:
+			self._append_network_event(
+				QANetworkEvent(
+					request_id=request_id,
+					method=self._request_methods.get(request_id, 'GET'),
+					url=url,
+					resource_type=resource_type,
+					status=status_code,
+				)
 			)
-		)
 		if status_code < 400:
 			self._request_urls.pop(request_id, None)
 			self._request_methods.pop(request_id, None)

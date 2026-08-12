@@ -24,7 +24,7 @@ from browser_use.qa.views import (
 	WebUITestStep,
 )
 
-_HTTP_URL_PATTERN = re.compile(r'https?://[^\s<>"\'，。；：！？、（）【】]+', re.IGNORECASE)
+_HTTP_URL_PATTERN = re.compile(r'https?://[^\s<>"\'\\\[\]\(\)，。；：！？、（）【】]+', re.IGNORECASE)
 _MAX_REQUIREMENT_REPAIR_ATTEMPTS = 2
 
 
@@ -50,11 +50,27 @@ class WebUITestStepDraft(BaseModel):
 	step_id: str = Field(min_length=1)
 	instruction: str = Field(min_length=1)
 	expected_result: str | None = None
-	source_evidence: list[str] = Field(default_factory=list)
+	source_evidence: list[str] = Field(
+		description='Exact Task/ground_truth quotes supporting expected_result; use [] only when expected_result is null'
+	)
 	requirement_references: list[RequirementReference] = Field(default_factory=list)
 	operation_kind: StepOperationKind = StepOperationKind.OTHER
 	side_effect_level: SideEffectLevel = SideEffectLevel.NONE
 	preconditions: list[str] = Field(default_factory=list)
+
+	@model_validator(mode='before')
+	@classmethod
+	def discard_unverified_requirement_references(cls, value: object) -> object:
+		"""Never trust model-authored provenance spans during stage-1 extraction."""
+
+		if isinstance(value, dict):
+			cleaned = dict(value)
+			# The compiler derives verified references from exact source_evidence
+			# matches after validation. Model-generated spans are neither required
+			# nor authoritative and can make an otherwise valid draft unparsable.
+			cleaned['requirement_references'] = []
+			return cleaned
+		return value
 
 	@model_validator(mode='after')
 	def validate_explicit_evidence(self) -> WebUITestStepDraft:
@@ -148,6 +164,7 @@ Extract the user's ordered business steps without adding, removing, combining, o
 One business step may later require multiple low-level browser actions.
 Set expected_result only when it is explicitly stated in the task or ground truth. Otherwise set it to null.
 Copy the exact supporting requirement phrase into source_evidence for every explicit expectation.
+Always leave requirement_references empty; the compiler derives and verifies source spans itself.
 Classify operation_kind as observe, click, input, navigate, submit, or other.
 Classify side_effect_level conservatively: publishing, deleting, paying, sending, and final submission are irreversible.
 Ground truth is the highest-priority requirement contract and must be mapped to the relevant steps.
@@ -162,8 +179,12 @@ Return only the requested structured output."""
 </ground_truth>
 
 Extract the business test specification. Navigation to the supplied start URL is setup, not a business step, unless the user explicitly gives it an expected result."""
-		draft = await self._extract_with_llm_repair(system_prompt=system_prompt, user_prompt=user_prompt)
-		return self._attach_verified_requirement_references(draft, task=task, ground_truth=ground_truth)
+		return await self._extract_with_llm_repair(
+			system_prompt=system_prompt,
+			user_prompt=user_prompt,
+			task=task,
+			ground_truth=ground_truth,
+		)
 
 	@staticmethod
 	def _attach_verified_requirement_references(
@@ -173,6 +194,25 @@ Extract the business test specification. Navigation to the supplied start URL is
 		ground_truth: str | None,
 	) -> WebUITestCaseDraft:
 		"""Resolve every explicit quote to an exact source span before browser execution."""
+
+		def resolve_reference(quote: str) -> RequirementReference | None:
+			start = task.find(quote)
+			if start >= 0:
+				return RequirementReference(
+					source=RequirementSource.TASK,
+					quote=quote,
+					start=start,
+					end=start + len(quote),
+				)
+			ground_truth_start = ground_truth.find(quote) if ground_truth else -1
+			if ground_truth_start >= 0:
+				return RequirementReference(
+					source=RequirementSource.GROUND_TRUTH,
+					quote=quote,
+					start=ground_truth_start,
+					end=ground_truth_start + len(quote),
+				)
+			return None
 
 		for step in draft.steps:
 			instruction_lower = step.instruction.casefold()
@@ -196,27 +236,20 @@ Extract the business test specification. Navigation to the supplied start URL is
 				continue
 			references: list[RequirementReference] = []
 			for quote in step.source_evidence:
-				start = task.find(quote)
-				if start >= 0:
-					references.append(
-						RequirementReference(
-							source=RequirementSource.TASK,
-							quote=quote,
-							start=start,
-							end=start + len(quote),
-						)
-					)
-					continue
-				ground_truth_start = ground_truth.find(quote) if ground_truth else -1
-				if ground_truth_start >= 0:
-					references.append(
-						RequirementReference(
-							source=RequirementSource.GROUND_TRUTH,
-							quote=quote,
-							start=ground_truth_start,
-							end=ground_truth_start + len(quote),
-						)
-					)
+				reference = resolve_reference(quote)
+				if reference is None and step.expected_result != quote:
+					# Models occasionally normalize punctuation in source_evidence even
+					# while copying expected_result verbatim. The exact expected-result
+					# substring is an equally authoritative, locally verified citation.
+					reference = resolve_reference(step.expected_result)
+				if reference is not None:
+					if not any(
+						existing.source == reference.source
+						and existing.start == reference.start
+						and existing.end == reference.end
+						for existing in references
+					):
+						references.append(reference)
 					continue
 				raise ValueError(
 					f'Explicit expectation evidence for step {step.step_id!r} is not an exact Task/ground_truth quote: {quote!r}'
@@ -224,10 +257,17 @@ Extract the business test specification. Navigation to the supplied start URL is
 			step.requirement_references = references
 		return draft
 
-	async def _extract_with_llm_repair(self, *, system_prompt: str, user_prompt: str) -> WebUITestCaseDraft:
+	async def _extract_with_llm_repair(
+		self,
+		*,
+		system_prompt: str,
+		user_prompt: str,
+		task: str,
+		ground_truth: str | None,
+	) -> WebUITestCaseDraft:
 		"""Ask the LLM to repair invalid structured output; never infer requirement semantics in code."""
 
-		last_error: ValidationError | BrowserUseStructuredPayloadError | None = None
+		last_error: ValueError | None = None
 		for attempt in range(_MAX_REQUIREMENT_REPAIR_ATTEMPTS + 1):
 			repair_system_prompt = system_prompt
 			repair_user_prompt = user_prompt
@@ -244,7 +284,11 @@ Extract the business test specification. Navigation to the supplied start URL is
 				else:
 					issues = [
 						{
-							'location': 'transport.reasoning',
+							'location': (
+								'transport.reasoning'
+								if isinstance(last_error, BrowserUseStructuredPayloadError)
+								else 'requirement_references'
+							),
 							'message': str(last_error),
 							'type': type(last_error).__name__,
 						}
@@ -266,14 +310,17 @@ Regenerate the complete test specification with all validation errors corrected.
 					repair_user_prompt,
 					output_format=WebUITestCaseDraft,
 				)
-				return WebUITestCaseDraft.model_validate(completion)
-			except (ValidationError, BrowserUseStructuredPayloadError) as error:
+				draft = WebUITestCaseDraft.model_validate(completion)
+				return self._attach_verified_requirement_references(draft, task=task, ground_truth=ground_truth)
+			except ValueError as error:
 				last_error = error
 				if attempt == _MAX_REQUIREMENT_REPAIR_ATTEMPTS:
 					break
 
+		detail = f'{type(last_error).__name__}: {last_error}' if last_error is not None else 'unknown validation error'
 		raise ValueError(
-			f'LLM could not generate a valid test structure after {_MAX_REQUIREMENT_REPAIR_ATTEMPTS} repair attempts'
+			f'LLM could not generate a valid test structure after {_MAX_REQUIREMENT_REPAIR_ATTEMPTS} repair attempts; '
+			f'last error: {detail[:1000]}'
 		) from last_error
 
 	async def complete_with_discovery(

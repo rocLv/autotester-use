@@ -159,6 +159,9 @@ uv run python examples/qa/halo_article_publish_qa.py --compare-rerun
 # 不依赖 Agent 和 LLM 的固定 DOM 性能上限。
 uv run python examples/qa/halo_no_llm_baseline.py
 
+# 在现成的 JJEBank 注册页填写表单并完成真实滑动验证；不会获取短信或提交注册。
+uv run python examples/qa/jjebank_register_slider_qa.py --headed
+
 # 显示浏览器窗口。
 uv run python examples/qa/halo_article_publish_qa.py --headed
 ```
@@ -410,6 +413,7 @@ uv run pre-commit run --all-files
 - [English README](README.md)
 - [完整 Halo QA Demo](examples/qa/halo_article_publish_qa.py)
 - [零 LLM 固定 DOM 基线](examples/qa/halo_no_llm_baseline.py)
+- [JJEBank 表单与滑动验证 QA Demo](examples/qa/jjebank_register_slider_qa.py)
 - [上游浏览器自动化文档](https://docs.browser-use.com)
 - [托管浏览器服务](https://cloud.browser-use.com)
 

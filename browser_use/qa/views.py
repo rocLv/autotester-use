@@ -447,6 +447,41 @@ class EvidenceArtifact(BaseModel):
 		return str(Path(value)) if value else None
 
 
+class ActionTargetProof(BaseModel):
+	"""Tool-authored, objectively verified proof that a custom action used its intended target."""
+
+	model_config = ConfigDict(extra='forbid')
+
+	target_name: str = Field(min_length=1, description='Non-sensitive name of the target controlled by the tool')
+	target_matched: bool
+	verification: dict[str, bool] = Field(
+		min_length=1,
+		description='Boolean checks performed by the tool against the live browser state',
+	)
+
+	@model_validator(mode='after')
+	def validate_target_match(self) -> ActionTargetProof:
+		if self.target_matched != all(self.verification.values()):
+			raise ValueError('target_matched must equal the conjunction of verification checks')
+		return self
+
+
+class ActionExpectationProof(BaseModel):
+	"""Tool-authored objective checks tied to an exact verified requirement quote."""
+
+	model_config = ConfigDict(extra='forbid')
+
+	requirement_quote: str = Field(min_length=1)
+	expectation_met: bool
+	verification: dict[str, bool] = Field(min_length=1)
+
+	@model_validator(mode='after')
+	def validate_expectation(self) -> ActionExpectationProof:
+		if self.expectation_met != all(self.verification.values()):
+			raise ValueError('expectation_met must equal the conjunction of verification checks')
+		return self
+
+
 class ActionReceipt(BaseModel):
 	"""Runner-owned proof that the intended low-level business action was attempted correctly."""
 

@@ -63,6 +63,31 @@ def test_evidence_monitor_ignores_successes_cancellations_and_console_info():
 	assert monitor.since(cursor).console_errors == []
 
 
+def test_evidence_monitor_keeps_business_requests_but_drops_successful_asset_noise():
+	monitor = QAEvidenceMonitor(MagicMock())
+	cursor = monitor.cursor()
+	monitor._on_response(
+		{
+			'requestId': 'image',
+			'type': 'Image',
+			'response': {'status': 200, 'url': 'data:image/png;base64,' + ('A' * 10_000)},
+		},
+		None,
+	)
+	monitor._on_response(
+		{
+			'requestId': 'verify',
+			'type': 'XHR',
+			'response': {'status': 200, 'url': 'https://example.com/api/verify-slider'},
+		},
+		None,
+	)
+
+	events = monitor.since(cursor).network_events
+	assert [event.request_id for event in events] == ['verify']
+	assert events[0].url == 'https://example.com/api/verify-slider'
+
+
 def test_evidence_monitor_allows_cross_domain_api_resources_but_ignores_other_tabs():
 	monitor = QAEvidenceMonitor(MagicMock(), NavigationScope.from_root_url('https://app.example.com'))
 	cursor = monitor.cursor()

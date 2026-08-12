@@ -155,6 +155,9 @@ uv run python examples/qa/halo_article_publish_qa.py --compare-rerun
 # Fixed-DOM performance ceiling with no Agent and no LLM.
 uv run python examples/qa/halo_no_llm_baseline.py
 
+# Fill the existing JJEBank registration form and solve its real slider; no SMS request or registration submission.
+uv run python examples/qa/jjebank_register_slider_qa.py --headed
+
 # Show the browser while running either Halo script.
 uv run python examples/qa/halo_article_publish_qa.py --headed
 ```
@@ -406,6 +409,7 @@ uv run pre-commit run --all-files
 - [Chinese README](README.zh-CN.md)
 - [Complete Halo QA demo](examples/qa/halo_article_publish_qa.py)
 - [Zero-LLM fixed-DOM baseline](examples/qa/halo_no_llm_baseline.py)
+- [JJEBank form and slider QA demo](examples/qa/jjebank_register_slider_qa.py)
 - [Upstream browser automation documentation](https://docs.browser-use.com)
 - [Hosted browser service](https://cloud.browser-use.com)
 

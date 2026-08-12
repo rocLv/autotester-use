@@ -2,7 +2,7 @@
 name = "autotester-use"
 description = "AI-driven Web UI QA with typed test cases, reliable verdicts, and deterministic replay"
 authors = [{ name = "Gregor Zunic" }]
-version = "0.13.8"
+version = "0.13.7.1"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11,<4.0"
