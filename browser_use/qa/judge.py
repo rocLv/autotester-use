@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -37,6 +38,19 @@ from browser_use.qa.views import (
 )
 
 _MAX_JUDGE_REPAIR_ATTEMPTS = 2
+logger = logging.getLogger(__name__)
+
+
+def _message_content_for_log(content: object) -> str:
+	if isinstance(content, str):
+		return content
+	if isinstance(content, list):
+		return '\n'.join(part.text if isinstance(part, ContentPartTextParam) else str(part) for part in content)
+	return str(content)
+
+
+def _messages_for_log(messages: list[BaseMessage]) -> str:
+	return '\n\n'.join(f'{message.role}:\n{_message_content_for_log(message.content)}' for message in messages)
 
 
 class _StepJudgementOutput(StepJudgement):
@@ -174,6 +188,7 @@ async def judge_test_step(
 	evidence: StepEvidence,
 	action_receipt: ActionReceipt | None = None,
 	on_llm_call: Callable[[], None] | None = None,
+	call_label: str = 'judge',
 ) -> StepJudgement:
 	"""Ask the judge to evaluate the step from observable browser facts."""
 
@@ -256,7 +271,16 @@ Cite the minimum supporting evidence IDs in evidence_ids. Do not invent IDs."""
 	async def invoke_judge(messages: list[BaseMessage]) -> _StepJudgementOutput:
 		if on_llm_call is not None:
 			on_llm_call()
-		return await invoke_qa_structured(llm, messages, output_format=_StepJudgementOutput)
+		logger.info(
+			'QA %s LLM request (step_id=%s, model=%s):\n%s',
+			call_label,
+			step.step_id,
+			getattr(llm, 'model', 'unknown'),
+			_messages_for_log(messages),
+		)
+		result = await invoke_qa_structured(llm, messages, output_format=_StepJudgementOutput)
+		logger.info('QA %s LLM response (step_id=%s):\n%s', call_label, step.step_id, result)
+		return result
 
 	try:
 		last_validation_error: ValidationError | None = None
@@ -371,4 +395,14 @@ Cite the minimum supporting evidence IDs in evidence_ids. Do not invent IDs."""
 		judgement.replay_assertions = _reliable_replay_assertions(step, evidence, judgement)
 	else:
 		judgement.replay_assertions = []
+		logger.warning(
+			'QA %s non-pass result for %s: status=%s origin=%s code=%s actual=%s reasoning=%s',
+			call_label,
+			step.step_id,
+			judgement.status.value,
+			judgement.failure_origin.value,
+			judgement.failure_code.value,
+			judgement.actual_result,
+			judgement.reasoning,
+		)
 	return judgement

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from urllib.parse import urlparse
 
@@ -26,6 +27,18 @@ from browser_use.qa.views import (
 
 _HTTP_URL_PATTERN = re.compile(r'https?://[^\s<>"\'\\\[\]\(\)，。；：！？、（）【】]+', re.IGNORECASE)
 _MAX_REQUIREMENT_REPAIR_ATTEMPTS = 2
+logger = logging.getLogger(__name__)
+
+_WEBSITE_FUNCTIONALITY_TESTING_GUIDANCE = """Apply the Browser Use Website Functionality Testing method within the user's stated scope:
+- Treat the supplied business steps as the requested user flows and preserve their order and boundaries.
+- For the specific feature named by the user, capture observable expected behavior for relevant UI elements, data entry and validation, error handling and messaging, and critical user journeys.
+- Registration, login, password reset, checkout, account settings, content submission, performance, and cross-browser checks are coverage examples, not default requirements. Include them only when the task or ground truth requests them.
+- Test case description and expected behavior belong in the compiled specification. Actual behavior, issue screenshots, and severity are runtime evidence and reporting fields; never invent them during compilation.
+- Do not broaden the test scope or add generic functionality checks that the user did not request."""
+
+
+def _messages_for_log(messages: list[SystemMessage | UserMessage]) -> str:
+	return '\n\n'.join(f'{message.role}:\n{message.content}' for message in messages)
 
 
 def extract_task_urls(task: str) -> list[str]:
@@ -159,7 +172,9 @@ class QATaskCompiler:
 	async def extract_requirements(self, *, task: str, ground_truth: str | None = None) -> WebUITestCaseDraft:
 		"""Extract only user-specified steps and expectations without consulting the page."""
 
-		system_prompt = """You perform stage 1 of Web UI QA requirement compilation.
+		system_prompt = f"""You perform stage 1 of Web UI QA requirement compilation.
+{_WEBSITE_FUNCTIONALITY_TESTING_GUIDANCE}
+
 Extract the user's ordered business steps without adding, removing, combining, or reordering intent.
 One business step may later require multiple low-level browser actions.
 Set expected_result only when it is explicitly stated in the task or ground truth. Otherwise set it to null.
@@ -337,7 +352,9 @@ Regenerate the complete test specification with all validation errors corrected.
 		if not draft.needs_exploration:
 			return self._case_from_explicit_draft(draft, scope)
 
-		system_prompt = """You perform stage 2 of Web UI QA requirement compilation.
+		system_prompt = f"""You perform stage 2 of Web UI QA requirement compilation.
+{_WEBSITE_FUNCTIONALITY_TESTING_GUIDANCE}
+
 The draft business-step IDs, instructions, ordering, preconditions, and non-null expected results are immutable.
 For null expected results only, use:
 - ui_contract when visible labels, ARIA semantics, HTML validation, or explicit UI text supports the expectation; cite it in source_evidence.
@@ -440,11 +457,16 @@ Complete only missing expected results and label their source."""
 
 	async def _invoke(self, system_prompt: str, user_prompt: str, *, output_format: type[BaseModel]):
 		self.call_count += 1
-		return await invoke_qa_structured(
-			self.llm,
-			[SystemMessage(content=system_prompt), UserMessage(content=user_prompt)],
-			output_format=output_format,
+		messages = [SystemMessage(content=system_prompt), UserMessage(content=user_prompt)]
+		logger.info(
+			'QA compiler LLM request (%s, model=%s):\n%s',
+			output_format.__name__,
+			getattr(self.llm, 'model', 'unknown'),
+			_messages_for_log(messages),
 		)
+		result = await invoke_qa_structured(self.llm, messages, output_format=output_format)
+		logger.info('QA compiler LLM response (%s):\n%s', output_format.__name__, result)
+		return result
 
 	@classmethod
 	def _case_from_explicit_draft(cls, draft: WebUITestCaseDraft, scope: NavigationScope) -> WebUITestCase:

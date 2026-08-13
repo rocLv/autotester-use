@@ -31,6 +31,7 @@ def _qa_llm() -> BaseChatModel:
 							'step_id': 'heading',
 							'instruction': 'Inspect the main page heading',
 							'expected_result': None,
+							'source_evidence': [],
 						}
 					],
 				}
@@ -49,7 +50,7 @@ def _qa_llm() -> BaseChatModel:
 					],
 				}
 			)
-		elif output_format is StepJudgement:
+		elif issubclass(output_format, StepJudgement):
 			evidence_ids = re.findall(r'ev_[0-9a-f]+', str(_messages))
 			assert evidence_ids
 			completion = output_format.model_validate(

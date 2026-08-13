@@ -16,6 +16,8 @@ uv sync
 
 - Pre-commit formatting: ALWAYS make sure to run pre-commit before making PRs.
 
+- Release versioning: Keep the first three components of the `autotester-use` package version identical to the currently synced upstream `browser-use` version. Use a fourth numeric component for independent `autotester-use` releases and increment it for each release on the same upstream base (for example, `browser-use 0.13.7` maps to `autotester-use 0.13.7.1`, then `0.13.7.2`). When the synced upstream version changes, reset the fourth component to `1`.
+
 - Use descriptive names and docstrings for each action.
 
 - Prefer returning `ActionResult` with structured content to help the agent reason better.

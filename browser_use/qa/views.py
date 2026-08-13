@@ -48,6 +48,33 @@ class SideEffectLevel(StrEnum):
 	IRREVERSIBLE = 'irreversible'
 
 
+class QAPlanStep(BaseModel):
+	"""Public, browser-independent view of one compiled QA plan step."""
+
+	model_config = ConfigDict(extra='forbid')
+
+	step_num: int = Field(ge=1)
+	step_id: str = Field(min_length=1)
+	instruction: str = Field(min_length=1)
+	expected_result: str | None = None
+	operation_kind: StepOperationKind
+	side_effect_level: SideEffectLevel
+	preconditions: list[str] = Field(default_factory=list)
+	source_evidence: list[str] = Field(default_factory=list)
+
+
+class QAPlanSnapshot(BaseModel):
+	"""Public snapshot emitted while QA requirements are compiled into executable steps."""
+
+	model_config = ConfigDict(extra='forbid')
+
+	status: Literal['generating', 'ready', 'final', 'failed']
+	preconditions: list[str] = Field(default_factory=list)
+	steps: list[QAPlanStep] = Field(default_factory=list)
+	needs_exploration: bool = False
+	error_message: str | None = None
+
+
 class PreconditionMode(StrEnum):
 	"""Whether a precondition is only checked or may be established."""
 

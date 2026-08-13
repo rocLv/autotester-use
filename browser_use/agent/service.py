@@ -101,6 +101,8 @@ from browser_use.qa.views import (
 	PreconditionStatus,
 	QACleanupResult,
 	QAPhaseTiming,
+	QAPlanSnapshot,
+	QAPlanStep,
 	QAPreconditionResult,
 	QARunResult,
 	QARunStatus,
@@ -132,6 +134,22 @@ from browser_use.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _message_content_for_llm_log(content: object) -> str:
+	if isinstance(content, str):
+		return content
+	if isinstance(content, list):
+		return '\n'.join(part.text if isinstance(part, ContentPartTextParam) else str(part) for part in content)
+	return str(content)
+
+
+def _messages_for_llm_log(messages: list[BaseMessage]) -> str:
+	return '\n\n'.join(f'{message.role}:\n{_message_content_for_llm_log(message.content)}' for message in messages)
+
+
+def _model_output_for_llm_log(value: object) -> str:
+	return str(value)
 
 
 def log_response(response: AgentOutput, registry=None, logger=None) -> None:
@@ -218,6 +236,11 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		register_done_callback: (
 			Callable[['AgentHistoryList'], Awaitable[None]]  # Async Callback
 			| Callable[['AgentHistoryList'], None]  # Sync Callback
+			| None
+		) = None,
+		register_qa_plan_callback: (
+			Callable[[QAPlanSnapshot], Awaitable[Any]]  # Async Callback
+			| Callable[[QAPlanSnapshot], Any]  # Sync Callback
 			| None
 		) = None,
 		register_external_agent_status_raise_error_callback: Callable[[], Awaitable[bool]] | None = None,
@@ -770,6 +793,7 @@ For submit, delete, payment, or other irreversible actions, do not repeat the ac
 		# Callbacks
 		self.register_new_step_callback = register_new_step_callback
 		self.register_done_callback = register_done_callback
+		self.register_qa_plan_callback = register_qa_plan_callback
 		self.register_should_stop_callback = register_should_stop_callback
 		self.register_external_agent_status_raise_error_callback = register_external_agent_status_raise_error_callback
 
@@ -1685,6 +1709,7 @@ For submit, delete, payment, or other irreversible actions, do not repeat the ac
 				return self.history
 
 			baseline_steps = {result.step.step_id: result for result in baseline_result.step_results}
+			await self._notify_qa_plan_callback(self._qa_plan_snapshot_from_case(self._qa_test_case))
 			self.logger.info('⚙️ Starting deterministic QA replay with zero LLM calls.')
 			self._ensure_browser_session_can_restart()
 			with self._measure_qa_phase('browser_start'):
@@ -2877,12 +2902,23 @@ For submit, delete, payment, or other irreversible actions, do not repeat the ac
 		kwargs: dict = {'output_format': self.AgentOutput, 'session_id': self.session_id}
 
 		try:
+			self.logger.info(
+				'QA executor LLM request (step=%s, model=%s):\n%s',
+				self.state.n_steps,
+				getattr(self.llm, 'model', 'unknown'),
+				_messages_for_llm_log(input_messages),
+			)
 			response = await self.llm.ainvoke(input_messages, **kwargs)
 			parsed: AgentOutput = response.completion  # type: ignore[assignment]
 
 			# Replace any shortened URLs in the LLM response back to original URLs
 			if urls_replaced:
 				self._recursive_process_all_strings_inside_pydantic_model(parsed, urls_replaced)
+			self.logger.info(
+				'QA executor LLM response (step=%s):\n%s',
+				self.state.n_steps,
+				_model_output_for_llm_log(parsed),
+			)
 
 			# cut the number of actions to max_actions_per_step if needed
 			if len(parsed.action) > self.settings.max_actions_per_step:
@@ -3990,6 +4026,7 @@ Expected state: {step.expected_result}"""
 
 		self._qa_compiled_task = self._qa_original_task
 		self._apply_qa_execution_limits()
+		await self._notify_qa_plan_callback(self._qa_plan_snapshot_from_case(self._qa_test_case))
 		self._log_qa_test_case_table('📋 Structured QA test case')
 		await self._start_qa_execution()
 
@@ -4544,6 +4581,7 @@ Expected state: {step.expected_result}"""
 				evidence=evidence,
 				action_receipt=evidence.action_receipt,
 				on_llm_call=self._record_qa_llm_call,
+				call_label='judge',
 			)
 		except Exception as exc:
 			self.logger.error(f'Independent QA step judge failed: {exc}', exc_info=True)
@@ -4580,6 +4618,7 @@ Expected state: {step.expected_result}"""
 					evidence=evidence,
 					action_receipt=evidence.action_receipt,
 					on_llm_call=self._record_qa_llm_call,
+					call_label='review',
 				)
 				review.secondary_status = secondary.status
 				review.agreed = secondary.status == judgement.status
@@ -4767,6 +4806,74 @@ Expected state: {step.expected_result}"""
 		else:
 			self.register_done_callback(self.history)
 
+	@staticmethod
+	def _qa_plan_step_preconditions(step: Any) -> list[str]:
+		return [item.description if hasattr(item, 'description') else str(item) for item in getattr(step, 'preconditions', [])]
+
+	@classmethod
+	def _qa_plan_snapshot_from_draft(cls, draft: WebUITestCaseDraft) -> QAPlanSnapshot:
+		return QAPlanSnapshot(
+			status='ready',
+			preconditions=list(draft.preconditions),
+			steps=[
+				QAPlanStep(
+					step_num=index,
+					step_id=step.step_id,
+					instruction=step.instruction,
+					expected_result=step.expected_result,
+					operation_kind=step.operation_kind,
+					side_effect_level=step.side_effect_level,
+					preconditions=cls._qa_plan_step_preconditions(step),
+					source_evidence=list(step.source_evidence),
+				)
+				for index, step in enumerate(draft.steps, start=1)
+			],
+			needs_exploration=draft.needs_exploration,
+		)
+
+	@classmethod
+	def _qa_plan_snapshot_from_case(cls, test_case: WebUITestCase) -> QAPlanSnapshot:
+		return QAPlanSnapshot(
+			status='final',
+			preconditions=[precondition.description for precondition in test_case.preconditions],
+			steps=[
+				QAPlanStep(
+					step_num=index,
+					step_id=step.step_id,
+					instruction=step.instruction,
+					expected_result=step.expected_result,
+					operation_kind=step.operation_kind,
+					side_effect_level=step.side_effect_level,
+					preconditions=cls._qa_plan_step_preconditions(step),
+					source_evidence=list(step.source_evidence),
+				)
+				for index, step in enumerate(test_case.steps, start=1)
+			],
+			needs_exploration=False,
+		)
+
+	@staticmethod
+	def _qa_plan_failed_snapshot(error_message: str) -> QAPlanSnapshot:
+		return QAPlanSnapshot(status='failed', error_message=error_message)
+
+	async def _notify_qa_plan_callback(self, snapshot: QAPlanSnapshot) -> None:
+		"""Invoke the public QA plan callback without letting callback failures fail the QA run."""
+
+		callback = self.register_qa_plan_callback
+		if callback is None:
+			return
+		try:
+			result = callback(snapshot)
+			if inspect.isawaitable(result):
+				await result
+		except Exception as exc:
+			self.logger.warning(
+				'QA plan callback failed for status %s: %s: %s',
+				snapshot.status,
+				type(exc).__name__,
+				exc,
+			)
+
 	@observe(name='agent.run', ignore_input=True, ignore_output=True)
 	@time_execution_async('--run')
 	async def run(
@@ -4812,6 +4919,7 @@ Expected state: {step.expected_result}"""
 			self._task_start_time = self._session_start_time
 
 			if self._qa_scope_error:
+				await self._notify_qa_plan_callback(self._qa_plan_failed_snapshot(self._qa_scope_error))
 				self._finalize_qa_result(
 					status=QARunStatus.INVALID_SPEC,
 					failure_origin=None,
@@ -4831,23 +4939,29 @@ Expected state: {step.expected_result}"""
 			if reuse_cached_case:
 				self._qa_test_case_draft = None
 				self.logger.info('♻️ Skipping Task compilation and discovery LLM calls for this repeated QA run.')
+				assert self._qa_test_case is not None
+				await self._notify_qa_plan_callback(self._qa_plan_snapshot_from_case(self._qa_test_case))
 			else:
 				# Stage 1 is browser-independent. A malformed/uncompilable specification
 				# must not launch Chromium or mutate any page state.
 				try:
 					compiler = QATaskCompiler(self.judge_llm)
 					try:
+						await self._notify_qa_plan_callback(QAPlanSnapshot(status='generating'))
 						self._qa_test_case_draft = await compiler.extract_requirements(
 							task=self._qa_original_task,
 							ground_truth=self.settings.ground_truth,
 						)
+						await self._notify_qa_plan_callback(self._qa_plan_snapshot_from_draft(self._qa_test_case_draft))
 					finally:
 						self._qa_llm_call_count += compiler.call_count
 				except (ValidationError, ValueError) as exc:
+					error_message = f'test structure could not be generated: {type(exc).__name__}: {exc}'
+					await self._notify_qa_plan_callback(self._qa_plan_failed_snapshot(error_message))
 					self._finalize_qa_result(
 						status=QARunStatus.INVALID_SPEC,
 						failure_origin=None,
-						summary=f'INVALID_SPEC: test structure could not be generated: {type(exc).__name__}: {exc}',
+						summary=f'INVALID_SPEC: {error_message}',
 						validation_errors=[str(exc)],
 					)
 					self.history.usage = await self.token_cost_service.get_usage_summary()
@@ -4855,11 +4969,13 @@ Expected state: {step.expected_result}"""
 					return self.history
 				except Exception as exc:
 					status, origin = self._qa_runtime_failure_status(exc, phase='specification')
+					error_message = f'QA specification compilation failed: {type(exc).__name__}: {exc}'
+					await self._notify_qa_plan_callback(self._qa_plan_failed_snapshot(error_message))
 					self._finalize_qa_result(
 						status=status,
 						failure_origin=origin,
 						failure_code=self._qa_runtime_failure_code(exc, phase='specification'),
-						summary=f'{status.value} during QA specification compilation: {type(exc).__name__}: {exc}',
+						summary=f'{status.value} during {error_message}',
 					)
 					self.history.usage = await self.token_cost_service.get_usage_summary()
 					await self._notify_qa_done_callback()
@@ -4945,6 +5061,7 @@ Expected state: {step.expected_result}"""
 				await self._notify_qa_done_callback()
 				return self.history
 			except (ValidationError, ValueError) as exc:
+				await self._notify_qa_plan_callback(self._qa_plan_failed_snapshot(f'{type(exc).__name__}: {exc}'))
 				self._finalize_qa_result(
 					status=QARunStatus.INVALID_SPEC,
 					failure_origin=None,
@@ -4956,6 +5073,7 @@ Expected state: {step.expected_result}"""
 				return self.history
 			except Exception as exc:
 				status, origin = self._qa_runtime_failure_status(exc, phase=self._qa_phase)
+				await self._notify_qa_plan_callback(self._qa_plan_failed_snapshot(f'{type(exc).__name__}: {exc}'))
 				self._finalize_qa_result(
 					status=status,
 					failure_origin=origin,

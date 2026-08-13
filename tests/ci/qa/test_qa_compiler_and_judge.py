@@ -419,6 +419,36 @@ async def test_compiler_preserves_explicit_expectation_and_marks_inferred_step()
 	assert case.steps[0].expectation_source == 'explicit'
 	assert case.steps[1].expectation_source == 'ui_contract'
 	assert llm.ainvoke.await_count == 2
+	stage_two_system_prompt = str(llm.ainvoke.await_args_list[1].args[0][0].content)
+	assert 'Browser Use Website Functionality Testing method' in stage_two_system_prompt
+	assert 'For null expected results only' in stage_two_system_prompt
+
+
+@pytest.mark.asyncio
+async def test_compiler_uses_functionality_testing_guidance_without_expanding_scope():
+	draft = WebUITestCaseDraft(
+		steps=[
+			WebUITestStepDraft(
+				step_id='step_1',
+				instruction='Click Articles',
+				expected_result='The article list is visible',
+				source_evidence=['Expected: the article list is visible'],
+			)
+		]
+	)
+	llm = _mock_llm(draft)
+
+	result = await QATaskCompiler(llm).extract_requirements(
+		task='Open https://example.com. Click Articles. Expected: the article list is visible.'
+	)
+
+	system_prompt = str(llm.ainvoke.await_args.args[0][0].content)
+	assert 'Browser Use Website Functionality Testing method' in system_prompt
+	assert 'UI elements, data entry and validation, error handling and messaging' in system_prompt
+	assert 'coverage examples, not default requirements' in system_prompt
+	assert 'Actual behavior, issue screenshots, and severity are runtime evidence' in system_prompt
+	assert 'Set expected_result only when it is explicitly stated' in system_prompt
+	assert [step.step_id for step in result.steps] == ['step_1']
 
 
 @pytest.mark.asyncio
